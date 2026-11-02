@@ -12,6 +12,10 @@ Commands (run them in this order the first time):
   python3 k2local.py chat [--window]               # chat in the terminal (--window: in a new terminal window)
   python3 k2local.py status | stop
 
+Or run it with Ollama or OpenCode instead of install / download / serve:
+  python3 k2local.py ollama --size 3.7B [--window]    # download through Ollama and chat
+  python3 k2local.py opencode --size 7B [--window]    # code with it in OpenCode, on top of Ollama
+
 Everything lives in one folder (default ~/k2-horizon-local, change with --dir or K2_DIR).
 """
 import argparse, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, tarfile, threading, time, zipfile
@@ -47,6 +51,9 @@ FORMATS = {
                   "The full-precision weights in one GGUF file for llama.cpp: original quality with nothing extra to install, but about twice the size of compressed and ~30% slower."),
 }
 PORT = 8080
+OLLAMA_REPO = "ifm/k2-horizon"     # IFM's official listing on Ollama
+OLLAMA_MIN = (0, 40, 4)            # the first Ollama version that runs K2 Horizon, per that listing
+OLLAMA_CONTEXT = 16384             # the same context as serve
 UA = {"User-Agent": "k2-horizon-local-skill"}
 
 
@@ -755,27 +762,122 @@ def open_chat_window():
     """Start the chat in a new terminal window, so an assistant that runs commands in the background can hand the
     user a chat they can type into."""
     py = f'"{sys.executable}"'   # the Python running now, in case python3 isn't on the new window's PATH
-    cmd = f"{run_hint(py)} chat --effort {ARGS.effort}"
-    system, ok = platform.system(), False
-    if system == "Darwin":
-        path = os.path.join(home(), "chat.command")   # Terminal opens .command files; no extra permission needed
-        with open(path, "w") as f:
-            f.write(f"#!/bin/sh\nclear\n{cmd}\n")
-        os.chmod(path, 0o755)
-        ok = subprocess.run(["open", path]).returncode == 0
-    elif system == "Windows":
-        path = os.path.join(home(), "chat.bat")
-        with open(path, "w") as f:
-            f.write(f"@echo off\r\ntitle K2 Horizon\r\n{cmd}\r\n")
-        os.startfile(path); ok = True
-    else:
-        for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
-            if shutil.which(term[0]):
-                subprocess.Popen(term + ["sh", "-c", cmd], start_new_session=True,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                ok = True; break
+    ok = open_in_window(f"{run_hint(py)} chat --effort {ARGS.effort}", "chat")
     say("✓ Opened the chat in a new terminal window." if ok else "✗ Couldn't open a terminal window on this computer.")
     say(f"  To start it yourself, run in a terminal: {run_hint()} chat")
+
+
+def open_in_window(cmd, name, folder=None):
+    """Run a command in a new terminal window, optionally from a folder. True if a window opened."""
+    system = platform.system()
+    if system == "Darwin":
+        path = os.path.join(home(), f"{name}.command")   # Terminal opens .command files; no extra permission needed
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nclear\n" + (f'cd "{folder}"\n' if folder else "") + f"{cmd}\n")
+        os.chmod(path, 0o755)
+        return subprocess.run(["open", path]).returncode == 0
+    if system == "Windows":
+        path = os.path.join(home(), f"{name}.bat")
+        with open(path, "w") as f:
+            f.write("@echo off\r\ntitle K2 Horizon\r\n" + (f'cd /d "{folder}"\r\n' if folder else "") + f"{cmd}\r\n")
+        os.startfile(path)
+        return True
+    for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
+        if shutil.which(term[0]):
+            subprocess.Popen(term + ["sh", "-c", (f'cd "{folder}" && ' if folder else "") + cmd], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- run with Ollama or OpenCode
+def ollama_tag(size, quant):
+    """IFM's tag on Ollama for a size and GGUF file: Q8_0 -> ifm/k2-horizon:3.7b-q8_0, BF16 -> ifm/k2-horizon:3.7b-bf16."""
+    return f"{OLLAMA_REPO}:{size.lower()}-" + ("bf16" if quant == "BF16" else "q" + quant[1:])
+
+
+def ensure_ollama():
+    """Ollama must be installed and new enough to know K2 Horizon; start its background service if it isn't running."""
+    if not shutil.which("ollama"):
+        raise SystemExit("Ollama isn't installed. Get it from https://ollama.com/download, then run this again.")
+    out = subprocess.run(["ollama", "--version"], capture_output=True, text=True)
+    v = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout + out.stderr)
+    if v and tuple(int(n) for n in v.groups()) < OLLAMA_MIN:
+        raise SystemExit(f"K2 Horizon needs Ollama {'.'.join(map(str, OLLAMA_MIN))} or newer, and this is {v.group(0)}. "
+                         "Update it from https://ollama.com/download, then run this again.")
+    if subprocess.run(["ollama", "list"], capture_output=True).returncode == 0:
+        return
+    kw = {"creationflags": 0x00000008 | 0x00000200} if platform.system() == "Windows" else {"start_new_session": True}
+    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    for _ in range(30):
+        time.sleep(1)
+        if subprocess.run(["ollama", "list"], capture_output=True).returncode == 0:
+            return
+    raise SystemExit("✗ Ollama is installed but didn't start. Open the Ollama app, then run this again.")
+
+
+def ollama_model():
+    """Download the chosen model through Ollama and return (name to run it by, IFM tag). The name points to IFM's model with
+    a bigger context: Ollama can default to 4,096 tokens, too few for high reasoning or a coding agent. IFM's listing
+    already sets the recommended temperature and top_p, and high reasoning is the model's own default."""
+    ensure_ollama()
+    size = ARGS.size
+    if not size:
+        raise SystemExit(f"Choose a size: {ARGS.cmd} --size 0.9B | 3.7B | 7B   (run check to see what fits)")
+    if ARGS.format == "gguf-bf16" and ARGS.quant not in (None, "BF16"):
+        raise SystemExit("--format gguf-bf16 is the BF16 file; leave out --quant (or use --format gguf with it).")
+    ram = total_ram_gb()
+    quant = "BF16" if ARGS.format == "gguf-bf16" else ARGS.quant or best_quant(size, ram)
+    if fit(MODELS[size]["gb"][quant], ram) == "too big":
+        say(f"⚠ {size} {quant} is too big for this computer's memory, so it will run very slowly. Run check to see what fits.")
+    tag = ollama_tag(size, quant)
+    name = f"k2-horizon-{size.lower()}" + ("-bf16" if quant == "BF16" else "")
+    say(f"Getting {tag} through Ollama ({MODELS[size]['gb'][quant]:.1f} GB; a rerun skips what's already downloaded) …")
+    if subprocess.run(["ollama", "pull", tag]).returncode != 0:
+        raise SystemExit("✗ Ollama couldn't download the model (see above). Check the internet connection and run this again.")
+    modelfile = os.path.join(home(), f"{name}.Modelfile")
+    with open(modelfile, "w") as f:
+        f.write(f"FROM {tag}\nPARAMETER num_ctx {OLLAMA_CONTEXT}\n")
+    out = subprocess.run(["ollama", "create", name, "-f", modelfile], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise SystemExit("✗ Ollama couldn't set up the model:\n" + (out.stdout + out.stderr)[-800:])
+    save_state(ollama_model=name, ollama_tag=tag)
+    say(f"✓ Ready in Ollama as {name} (from {tag}, {OLLAMA_CONTEXT:,}-token context).")
+    return name, tag
+
+
+def hand_over(args, name, folder=None):
+    """Start an interactive program: in a new window with --window, or here if this is a real terminal."""
+    if ARGS.window:
+        if open_in_window(" ".join(f'"{a}"' if " " in a else a for a in args), name, folder):
+            say("✓ Opened it in a new terminal window.")
+        else:
+            say("✗ Couldn't open a terminal window on this computer.")
+    elif sys.stdin.isatty():
+        subprocess.run(args, cwd=folder)
+
+
+def cmd_ollama():
+    name, tag = ollama_model()
+    say(f"  Chat: ollama run {name}   (inside: /set think high|medium|low, /bye to quit)\n"
+        f"  API:  http://127.0.0.1:11434/v1  with model \"{name}\"\n"
+        f"  Remove it: ollama rm {name} {tag}")
+    hand_over(["ollama", "run", name], "ollama-chat")
+
+
+def cmd_opencode():
+    if not shutil.which("opencode"):
+        raise SystemExit("OpenCode isn't installed. Get it from https://opencode.ai/download "
+                         "(or run: curl -fsSL https://opencode.ai/install | bash), then run this again in a new terminal.")
+    if ARGS.size == "0.9B":
+        say("⚠ 0.9B is too small for coding work: in testing it guessed a file path that didn't exist. 3.7B or 7B handled the same task.")
+    folder = os.path.abspath(os.path.expanduser(ARGS.folder))
+    if not os.path.isdir(folder):
+        raise SystemExit(f"✗ No such folder: {folder}")
+    name, tag = ollama_model()
+    say(f"  Start it again later, from your project folder: ollama launch opencode --model {name}\n"
+        f"  Remove the model: ollama rm {name} {tag}")
+    hand_over(["ollama", "launch", "opencode", "--model", name, "-y"], "opencode", folder)
 
 
 # ---------------------------------------------------------------- main
@@ -807,12 +909,17 @@ def main():
     p.add_argument("--max-tokens", type=int, help="limit the reply length (default: no limit)"); p.add_argument("--show-thinking", action="store_true")
     p = sp("chat"); p.add_argument("--effort", default="high", choices=["low", "medium", "high"])
     p.add_argument("--max-tokens", type=int, help="limit each reply's length (default: no limit)"); p.add_argument("--window", action="store_true", help="open the chat in a new terminal window")
+    for name in ("ollama", "opencode"):
+        p = sp(name); p.add_argument("--size", choices=list(MODELS)); p.add_argument("--format", default="gguf", choices=fmts)
+        p.add_argument("--quant", choices=["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "BF16"], help="GGUF file to use (BF16 = --format gguf-bf16)")
+        p.add_argument("--window", action="store_true", help="open it in a new terminal window")
+    p.add_argument("--folder", default=".", help="the project folder to work in (default: the current one)")
     sp("status"); sp("stop")
     ARGS = ap.parse_args()
     ARGS.dir = getattr(ARGS, "dir", None)
     ARGS.port = getattr(ARGS, "port", PORT)
     {"check": cmd_check, "install": cmd_install, "download": cmd_download, "serve": cmd_serve,
-     "ask": cmd_ask, "chat": cmd_chat, "status": cmd_status, "stop": cmd_stop}[ARGS.cmd]()
+     "ask": cmd_ask, "chat": cmd_chat, "ollama": cmd_ollama, "opencode": cmd_opencode, "status": cmd_status, "stop": cmd_stop}[ARGS.cmd]()
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 ---
 name: k2-horizon-local
-description: Install and run K2 Horizon (MBZUAI / IFM) locally on the user's own Mac, Linux or Windows computer, in the size that fits their machine (0.9B, 3.7B or 7B) and the GGUF format they want (compressed, or full-quality BF16). Checks the computer, lets the user pick the size and format, then downloads, starts and tests it. Use this whenever someone wants to run, deploy, install, self-host, try offline, or set up K2 Horizon (or "K2 0.9B / 3.7B / 7B", "IFM model") on their own laptop, desktop or device, or asks which K2 Horizon size their computer can handle, even if they don't mention llama.cpp or GGUF. Also use it to switch sizes, restart, test, stop or troubleshoot an existing local K2 Horizon setup.
+description: Install and run K2 Horizon (MBZUAI / IFM) locally on the user's own Mac, Linux or Windows computer, in the size that fits their machine (0.9B, 3.7B or 7B) and the GGUF format they want (compressed, or full-quality BF16), with the built-in llama.cpp setup, Ollama, or OpenCode. Checks the computer, lets the user pick the size, format and way to run it, then downloads, starts and tests it. Use this whenever someone wants to run, deploy, install, self-host, try offline, or set up K2 Horizon (or "K2 0.9B / 3.7B / 7B", "IFM model"), including with Ollama or OpenCode, on their own laptop, desktop or device, or asks which K2 Horizon size their computer can handle, even if they don't mention llama.cpp or GGUF. Also use it to switch sizes, restart, test, stop or troubleshoot an existing local K2 Horizon setup.
 ---
 
 # Run K2 Horizon locally, in the size that fits
 
-This skill takes someone from nothing to a working, private copy of K2 Horizon on their own computer. It checks what the machine can handle, lets the **user** pick the size and format, then installs, downloads, starts and tests it. Everything goes through one helper script, `k2local.py`, which step 0 fetches from GitHub if it isn't next to this file, so this file is all a user needs to share. The script uses only Python's standard library, so it works on macOS, Linux and Windows with any AI assistant that can run commands. Nothing else gets installed besides llama.cpp, which runs the model.
+This skill takes someone from nothing to a working, private copy of K2 Horizon on their own computer. It checks what the machine can handle, lets the **user** pick the size, format and way to run it, then installs, downloads, starts and tests it. Everything goes through one helper script, `k2local.py`, which step 0 fetches from GitHub if it isn't next to this file, so this file is all a user needs to share. The script uses only Python's standard library, so it works on macOS, Linux and Windows with any AI assistant that can run commands. The built-in way installs only llama.cpp, which runs the model.
 
 The guidance comes from real runs on an Apple M4 Pro with 24 GB of memory: all three sizes were tested with the same 12 tasks. Where a step exists because something went wrong in testing, the reason is given so you can adapt.
 
@@ -76,20 +76,44 @@ Leave out sizes marked "too big", or mention them only to say they won't run wel
 
 Then offer the format, in one short message with the two one-sentence explanations (from `check` or the table above). Compressed GGUF is the default and the right answer for most people: if the user doesn't care, or you can't ask, use it without making a fuss. Only offer BF16 for sizes `check` marks as fitting, and suggest it if the user wants full quality.
 
-### 3. Install
+### 3. Let the user choose how to run it
+Ask in one short message, unless they already said. If they don't care, or you can't ask, use the built-in way.
+
+> How would you like to run it?
+> 1. **Built-in:** chat in the terminal or your browser, with nothing else to install. *Recommended.*
+> 2. **Ollama:** best if you already use Ollama, or apps that connect to it.
+> 3. **OpenCode:** a coding agent that reads and edits your project, running the model through Ollama.
+
+**1. Built-in:** continue with steps 4 to 8.
+
+**2. Ollama:** run this, then stop here. Steps 4 to 8 are for the built-in way only.
+```
+python3 k2local.py ollama --size 3.7B --window     # optional: --format gguf-bf16, --quant Q4_K_M | Q5_K_M | Q6_K | Q8_0
+```
+
+**3. OpenCode:** ask which project folder to work in, recommend 3.7B or 7B, then run this and stop here. In testing, 3.7B found a typo in a file and fixed it, while 0.9B guessed a file path that didn't exist.
+```
+python3 k2local.py opencode --size 7B --folder "/path/to/project" --window
+```
+
+For both, the script needs Ollama 0.40.4 or newer. If a tool is missing, it prints where to get it: pass that on, and ask before installing anything for the user. It downloads IFM's official `ifm/k2-horizon` model through Ollama, picking the same file as `check` unless you pass `--quant`, and opens the program in a new terminal window. The download is the longest step, so run it in the background if you can. Ollama keeps its own copy of the model, separate from the built-in way's files, so someone using both downloads it twice.
+
+Tell the user how to start it again and how to remove it: the script prints the exact commands. There's no web chat with Ollama or OpenCode. Ollama's API is at `http://127.0.0.1:11434/v1`.
+
+### 4. Install
 ```
 python3 k2local.py install
 ```
 This downloads llama.cpp build b11619, the one K2 Horizon was tested with, choosing the right file for the OS and GPU: Metal on Apple Silicon, CUDA for NVIDIA, Vulkan or CPU otherwise. It downloads straight from llama.cpp's GitHub releases page without using the GitHub API, which allows only 60 anonymous calls an hour per network and failed on a shared office network. It never updates by itself. Only if the user asks for a newer llama.cpp, run `stop`, then `install --build latest` (or a build number such as `--build b11669`), and tell them it hasn't been tested with K2 Horizon. `install --build tested` goes back to b11619. On macOS it also removes the "downloaded from the internet" quarantine flag that would otherwise block the program. To override the choice, use `--backend cpu|cuda|vulkan`, for example if the CUDA build fails to start.
 
-### 4. Download the chosen size and format
+### 5. Download the chosen size and format
 ```
 python3 k2local.py download --size 3.7B                        # compressed GGUF; optional: --quant Q4_K_M | Q5_K_M | Q6_K | Q8_0
 python3 k2local.py download --size 0.9B --format gguf-bf16      # full-quality GGUF
 ```
 This downloads the official files from IFM's Hugging Face page. For compressed GGUF it picks the best quality that fits comfortably unless you pass `--quant`. It uses 8 parallel connections, keeps the computer awake, and verifies the SHA-256 checksum. For the bigger sizes this is the longest step, so run it in the background if you can and report progress. If it stops, the same command resumes it. Single connections stalled and a sleeping Mac froze downloads in testing, which is why the script works this way.
 
-### 5. Start it
+### 6. Start it
 ```
 python3 k2local.py serve --size 3.7B                  # optional: --format gguf | gguf-bf16
 ```
@@ -103,7 +127,7 @@ One known exception: at medium effort, 3.7B opens with `<ifm|think_fast>` but cl
 
 Only one model runs at a time. To switch size or format, run `stop` and then `serve --size <size> --format <format>`.
 
-### 6. Test it
+### 7. Test it
 ```
 python3 k2local.py ask "Split 86 equally between 3 people. How much does each get?"
 ```
@@ -111,7 +135,7 @@ Expect 28⅔ (about 28.67) and a speed line. Answers vary a little between runs:
 
 Show the user the answer and the speed. If they like, ask one question of their own.
 
-### 7. Hand it over
+### 8. Hand it over
 First open a chat for the user in a new terminal window:
 ```
 python3 k2local.py chat --window

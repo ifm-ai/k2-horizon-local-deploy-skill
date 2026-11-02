@@ -2,13 +2,13 @@
 
 ![Run K2 Horizon on your own computer: 0.9B, 3.7B and 7B](docs/images/banner.svg)
 
-Run [K2 Horizon](https://huggingface.co/IFM), the open models from MBZUAI's Institute of Foundation Models, privately on your own computer. One script checks your computer, picks the right model file, then installs, downloads and starts it. After the download, nothing leaves your machine.
+Run [K2 Horizon](https://huggingface.co/IFM), the open models from MBZUAI's Institute of Foundation Models, privately on your own computer, with the built-in setup, Ollama or OpenCode. One script checks your computer, picks the right model file, then installs, downloads and starts it. After the download, nothing leaves your machine.
 
 Works on macOS, Linux and Windows. It only needs Python 3.8+.
 
 ## Quick start
 
-**With an AI agent:** give it [`SKILL.md`](k2-horizon-local/SKILL.md) and ask it to *"set up K2 Horizon on my computer."* It does every step and lets you choose the size.
+**With an AI agent:** give it [`SKILL.md`](k2-horizon-local/SKILL.md) and ask it to *"set up K2 Horizon on my computer."* It does every step and lets you choose the size and how to run it.
 
 **By hand:** download this repository (**Code → Download ZIP**), open a terminal in its folder, and run:
 
@@ -21,6 +21,17 @@ python3 k2-horizon-local/scripts/k2local.py chat                   # chat in the
 ```
 
 On Windows, use `py` instead of `python3`.
+
+## Ollama or OpenCode
+
+Prefer another way to run it? Replace `install`, `download` and `serve` with one of these:
+
+```bash
+python3 k2-horizon-local/scripts/k2local.py ollama --size 3.7B     # chat through Ollama
+python3 k2-horizon-local/scripts/k2local.py opencode --size 7B     # code with OpenCode, from your project folder
+```
+
+You need [Ollama](https://ollama.com/download) 0.40.4 or newer, and [OpenCode](https://opencode.ai/download) for the second one. Use 3.7B or 7B with OpenCode: 0.9B is too small for coding work.
 
 ## Which size?
 
@@ -47,8 +58,10 @@ These are compressed files. For full quality, add `--format gguf-bf16` to `downl
 | `chat` | Chats in the terminal (`--window` opens a new window) |
 | `ask "…"` | Asks one question |
 | `status` / `stop` | Shows what's running / stops it |
+| `ollama --size …` | Sets up the model in Ollama and starts a chat |
+| `opencode --size …` | Sets up the model in Ollama and starts OpenCode |
 
-Everything is stored in `~/k2-horizon-local`. To remove it all, delete that folder.
+Everything is stored in `~/k2-horizon-local`. To remove it all, delete that folder. Ollama keeps its own copy of the model: remove that with `ollama rm`.
 
 ## Something went wrong?
 

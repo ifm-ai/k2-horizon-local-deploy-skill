@@ -45,5 +45,13 @@ Port 8080 is taken. `serve` now checks this and says so. Run `stop` if it's an e
 ## "X isn't downloaded yet" or "Y is running. Run stop first"
 Each size and format is downloaded separately (`download --size … --format …`), and only one runs at a time. `status` lists what's downloaded and what's running. In the state, `7B` is compressed GGUF and `7B-bf16` is BF16 GGUF.
 
+## Ollama and OpenCode
+- **"unknown model architecture: 'k2-horizon'".** Ollama is too old. K2 Horizon needs 0.40.4 or newer: update it from https://ollama.com/download.
+- **"Ollama is installed but didn't start".** Open the Ollama app, then run the command again.
+- **"OpenCode isn't installed" right after installing it.** The new command isn't on this terminal's path yet. Open a new terminal and run it again.
+- **OpenCode reads the wrong files, or gives up.** 0.9B is too small for this: in testing it guessed a file path that didn't exist. Use 3.7B or 7B.
+- **Long conversations or big projects lose earlier context.** The script gives the model a 16,384-token context. To change it, edit `PARAMETER num_ctx` in the `.Modelfile` in `~/k2-horizon-local`, then run `ollama create <name> -f <that file>`. More context uses more memory.
+- **Disk space.** Ollama keeps its own copy of the model. `ollama list` shows them, and `ollama rm <name>` removes one.
+
 ## 0.9B gets simple reasoning wrong
 That's the model, not the setup. In testing it answered "28, 28, 30" to an equal split, and it picked an outdated document over the current one. Use 3.7B or 7B when correctness matters. 0.9B is meant for quick commands on tiny devices.
