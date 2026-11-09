@@ -1,108 +1,160 @@
 #!/usr/bin/env python3
-"""Run K2 Horizon 0.9B, 3.7B or 7B locally. Standard library only (Python 3.8+), macOS / Linux / Windows.
+"""Run K2 Horizon (0.9B, 3.7B or 7B) on your own computer.
 
-Two formats, both run with llama.cpp: gguf (compressed, the default) and gguf-bf16 (full quality).
+First time, in this order:
+  k2local.py check                     what fits on this computer
+  k2local.py install                   download llama.cpp (--build latest for the newest)
+  k2local.py download --size 3.7B      download and verify a model
+  k2local.py serve --size 3.7B         start it in the background
+  k2local.py chat                      chat in the terminal (--window for a new window)
+  k2local.py ask "question"            ask one question
 
-Commands (run them in this order the first time):
-  python3 k2local.py check                         # what fits on this computer, for each size and format
-  python3 k2local.py install [--build latest]      # llama.cpp for this OS and GPU (the tested build unless asked)
-  python3 k2local.py download --size 3.7B [--format F] [--quant Q]  # download + verify (repeat for others)
-  python3 k2local.py serve [--size 3.7B] [--format F]  # start a model in the background, wait until ready
-  python3 k2local.py ask "question"                # send a question, print the answer and speed
-  python3 k2local.py chat [--window]               # chat in the terminal (--window: in a new terminal window)
-  python3 k2local.py status | stop
+Or use Ollama instead of install / download / serve:
+  k2local.py ollama --size 3.7B        chat through Ollama
+  k2local.py opencode --size 7B        code with OpenCode, on top of Ollama
 
-Or run it with Ollama or OpenCode instead of install / download / serve:
-  python3 k2local.py ollama --size 3.7B [--window]    # download through Ollama and chat
-  python3 k2local.py opencode --size 7B [--window]    # code with it in OpenCode, on top of Ollama
-
-Everything lives in one folder (default ~/k2-horizon-local, change with --dir or K2_DIR).
+Other commands: status, stop.
+Files are kept in ~/k2-horizon-local (change it with --dir or K2_DIR).
+Needs Python 3.8+, nothing else.
 """
-import argparse, hashlib, json, os, platform, re, shutil, signal, subprocess, sys, tarfile, threading, time, zipfile
-import urllib.request, urllib.error
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import zipfile
 
-TESTED_BUILD = "b11619"           # the llama.cpp build K2 Horizon was tested with; newer ones only on request
-LLAMA_RELEASES = "https://github.com/ggml-org/llama.cpp/releases"
-# Official GGUF repos from IFM. Sizes in GB. "notes" come from our own tests on an Apple M4 Pro (24 GB).
-MODELS = {
-    # Note: IFM names the 0.9B files "1B" and the 3.7B files "4B".
-    "0.9B": {"repo": "IFM/K2-Horizon-0.9B-GGUF", "prefix": "K2-Horizon-1B", "temp": 0.6,   # IFM recommends 0.6 for 0.9B
-             "gb": {"Q4_K_M": 0.67, "Q5_K_M": 0.77, "Q6_K": 0.89, "Q8_0": 1.15, "BF16": 2.16},
-             "speed": "~165 tokens/s (Q8, M4 Pro)", "made_for": "watches, glasses, quick commands",
-             "good": "instant replies, reminders, simple tool calls, short translations",
-             "weak": "slips on reasoning: picked an outdated document, split 86 three ways as 28+28+30"},
-    "3.7B": {"repo": "IFM/K2-Horizon-3.7B-GGUF", "prefix": "K2-Horizon-4B", "temp": 1.0,
-             "gb": {"Q4_K_M": 3.16, "Q5_K_M": 3.64, "Q6_K": 4.16, "Q8_0": 5.39, "BF16": 10.13},
-             "speed": "~46 tokens/s (Q8, M4 Pro)", "made_for": "phones and everyday laptop use",
-             "good": "summaries, document questions, tool calls, code fixes, correct math in our tests",
-             "weak": "Arabic phrasing and transliteration were partly wrong"},
-    "7B":   {"repo": "IFM/K2-Horizon-7B-GGUF", "prefix": "K2-Horizon-7B", "temp": 1.0,
-             "gb": {"Q4_K_M": 5.59, "Q5_K_M": 6.47, "Q6_K": 7.39, "Q8_0": 9.57, "BF16": 18.01},
-             "speed": "~40 tokens/s (Q4, M4 Pro)", "made_for": "laptops and developer workstations",
-             "good": "passed every check in our 12 tests: coding, agents, reviews, research",
-             "weak": "slowest of the three; needs ~16 GB+ memory (on smaller machines it uses a more compressed file)"},
-}
-# One sentence each, shown by check so the user can choose. Speed comparisons are from 0.9B on an M1 Pro (16 GB):
-# Q8 GGUF ~105 tokens/s, BF16 GGUF ~74.
-FORMATS = {
-    "gguf": ("GGUF, compressed",
-             "A compressed single file run by llama.cpp: the smallest download and the fastest replies on any computer, with a small loss in quality."),
-    "gguf-bf16": ("GGUF, full quality (BF16)",
-                  "The full-precision weights in one GGUF file for llama.cpp: original quality with nothing extra to install, but about twice the size of compressed and ~30% slower."),
-}
+TESTED_BUILD = "b11619"  # llama.cpp build tested with K2 Horizon
+RELEASES = "https://github.com/ggml-org/llama.cpp/releases"
 PORT = 8080
-OLLAMA_REPO = "ifm/k2-horizon"     # IFM's official listing on Ollama
-OLLAMA_MIN = (0, 40, 4)            # the first Ollama version that runs K2 Horizon, per that listing
-OLLAMA_CONTEXT = 16384             # the same context as serve
-UA = {"User-Agent": "k2-horizon-local-skill"}
+CONTEXT = 16384
+QUANTS = ["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "BF16"]
+EFFORTS = ["low", "medium", "high"]
+HEADERS = {"User-Agent": "k2-horizon-local"}
+
+OLLAMA_REPO = "ifm/k2-horizon"
+OLLAMA_MIN = (0, 40, 4)
+
+# IFM's GGUF repos. IFM names the 0.9B files "1B" and the 3.7B files "4B".
+# File sizes are in GB. Speeds were measured on an M4 Pro with 24 GB.
+MODELS = {
+    "0.9B": {
+        "repo": "IFM/K2-Horizon-0.9B-GGUF",
+        "prefix": "K2-Horizon-1B",
+        "temp": 0.6,
+        "gb": {"Q4_K_M": 0.67, "Q5_K_M": 0.77, "Q6_K": 0.89, "Q8_0": 1.15, "BF16": 2.16},
+        "speed": "~165 tokens/s (Q8)",
+        "made_for": "watches, glasses, quick commands",
+        "good": "instant replies, reminders, simple tool calls, short translations",
+        "weak": "makes reasoning mistakes, e.g. split 86 three ways as 28+28+30",
+    },
+    "3.7B": {
+        "repo": "IFM/K2-Horizon-3.7B-GGUF",
+        "prefix": "K2-Horizon-4B",
+        "temp": 1.0,
+        "gb": {"Q4_K_M": 3.16, "Q5_K_M": 3.64, "Q6_K": 4.16, "Q8_0": 5.39, "BF16": 10.13},
+        "speed": "~46 tokens/s (Q8)",
+        "made_for": "phones and everyday laptop use",
+        "good": "summaries, document questions, tool calls, code fixes",
+        "weak": "Arabic phrasing and transliteration were partly wrong",
+    },
+    "7B": {
+        "repo": "IFM/K2-Horizon-7B-GGUF",
+        "prefix": "K2-Horizon-7B",
+        "temp": 1.0,
+        "gb": {"Q4_K_M": 5.59, "Q5_K_M": 6.47, "Q6_K": 7.39, "Q8_0": 9.57, "BF16": 18.01},
+        "speed": "~40 tokens/s (Q4)",
+        "made_for": "laptops and developer workstations",
+        "good": "coding, agents, reviews, research",
+        "weak": "slowest of the three; needs 16 GB+ memory",
+    },
+}
+
+FORMATS = {
+    "gguf": (
+        "GGUF, compressed",
+        "A compressed single file run by llama.cpp: the smallest download and the fastest "
+        "replies, with a small loss in quality.",
+    ),
+    "gguf-bf16": (
+        "GGUF, full quality (BF16)",
+        "The full-precision weights in one file for llama.cpp: original quality, but about "
+        "twice the size and ~30% slower.",
+    ),
+}
+
+ARGS = None
 
 
-# ---------------------------------------------------------------- helpers
+# Storage and state
+
 def home():
-    d = os.path.expanduser(ARGS.dir or os.environ.get("K2_DIR") or "~/k2-horizon-local")  # --dir, then K2_DIR, then default
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def say(msg=""):
-    print(msg, flush=True)
-
-
-def fetch_json(url):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-        return json.loads(r.read())
-
-
-def state_path():
-    return os.path.join(home(), "state.json")
+    path = os.path.expanduser(ARGS.dir or os.environ.get("K2_DIR") or "~/k2-horizon-local")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def load_state():
     try:
-        return json.load(open(state_path()))
-    except Exception:
+        with open(os.path.join(home(), "state.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
         return {}
 
 
-def save_state(**kw):
-    s = load_state(); s.update(kw)
-    json.dump(s, open(state_path(), "w"), indent=1)
+def save_state(**changes):
+    state = load_state()
+    state.update(changes)
+    with open(os.path.join(home(), "state.json"), "w") as f:
+        json.dump(state, f, indent=1)
 
 
-def keep_awake():
-    """Stop the computer from sleeping during long work. Sleep stalled our downloads to almost nothing."""
-    system = platform.system()
-    if system == "Darwin" and shutil.which("caffeinate"):
-        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
-    elif system == "Windows":
-        try:
-            import ctypes
-            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)  # CONTINUOUS | SYSTEM_REQUIRED
-        except Exception:
-            pass
-    elif system == "Linux" and shutil.which("systemd-inhibit"):
-        pass  # best effort only; most Linux desktops don't sleep mid-download
+def model_key(size, fmt):
+    """How a download is stored in the state file: "7B" or "7B-bf16"."""
+    return size + "-bf16" if fmt == "gguf-bf16" else size
 
+
+def key_size(key):
+    return key.split("-")[0]
+
+
+def key_format(key):
+    return "gguf-bf16" if key.endswith("-bf16") else "gguf"
+
+
+def label(key):
+    return key_size(key) + (" BF16" if key_format(key) == "gguf-bf16" else "")
+
+
+def downloaded_models(state):
+    # Older versions of the script could also record "-original" models; skip those.
+    models = state.get("models") or {}
+    return {k: v for k, v in models.items() if not k.endswith("-original")}
+
+
+def command_hint(python=None):
+    """The command to type later, with --dir and --port when they aren't the defaults."""
+    python = python or ("py" if platform.system() == "Windows" else "python3")
+    hint = f'{python} "{os.path.abspath(__file__)}"'
+    if home() != os.path.expanduser("~/k2-horizon-local"):
+        hint += f' --dir "{home()}"'
+    if ARGS.port != PORT:
+        hint += f" --port {ARGS.port}"
+    return hint
+
+
+# Hardware
 
 def total_ram_gb():
     system = platform.system()
@@ -110,18 +162,24 @@ def total_ram_gb():
         if system == "Darwin":
             return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"])) / 2**30
         if system == "Linux":
-            for line in open("/proc/meminfo"):
-                if line.startswith("MemTotal:"):
-                    return int(line.split()[1]) / 2**20
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) / 2**20
         if system == "Windows":
             import ctypes
-            class MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
-                            ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            m = MS(); m.dwLength = ctypes.sizeof(MS)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-            return m.ullTotalPhys / 2**30
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+                    (name, ctypes.c_ulonglong)
+                    for name in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                                 "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")
+                ]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(status)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            return status.ullTotalPhys / 2**30
     except Exception:
         pass
     return None
@@ -141,9 +199,19 @@ def gpu_kind():
     return "none"
 
 
+def keep_awake():
+    """Downloads stall when the computer goes to sleep."""
+    if platform.system() == "Darwin" and shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+    elif platform.system() == "Windows":
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+
+
 def fit(gb, ram):
-    """How well a file fits. Real data point: the 9.6 GB 7B Q8 file swapped to ~3 tokens/s on a 24 GB Mac
-    with a browser open, while 5.6 GB ran at ~40 tokens/s. So keep the file under ~25% of total memory."""
+    # Keep the file under a quarter of the memory. On a 24 GB Mac the 9.6 GB file
+    # swapped to disk and dropped to ~3 tokens/s, while 5.6 GB ran at ~40.
     if ram is None:
         return "unknown"
     if gb <= ram * 0.25:
@@ -154,340 +222,355 @@ def fit(gb, ram):
 
 
 def best_quant(size, ram):
-    """Highest quality file that fits comfortably; otherwise the smallest file (which may be tight or too big)."""
-    gbs = MODELS[size]["gb"]
-    for q in ("Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M"):
-        if fit(gbs[q], ram) == "comfortable":
-            return q
+    """The best quality file that fits comfortably, or the smallest one."""
+    for quant in ("Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M"):
+        if fit(MODELS[size]["gb"][quant], ram) == "comfortable":
+            return quant
     return "Q4_K_M"
 
 
-def options(ram):
-    out = []
-    for size, m in MODELS.items():
-        q = best_quant(size, ram)
-        out.append({"size": size, "quant": q, "file_gb": m["gb"][q], "fit": fit(m["gb"][q], ram),
-                    "speed_measured": m["speed"], "made_for": m["made_for"], "good_at": m["good"], "watch_out": m["weak"]})
-    return out
+def pick_quant(size):
+    if ARGS.format == "gguf-bf16" and ARGS.quant not in (None, "BF16"):
+        sys.exit("--format gguf-bf16 is the BF16 file, so leave out --quant.")
+    if ARGS.format == "gguf-bf16" or ARGS.quant == "BF16":
+        return "BF16"
+    return ARGS.quant or best_quant(size, total_ram_gb())
 
 
-def recommend(opts):
-    """Largest size that fits comfortably: more capable, still fast. The user can pick a smaller one for speed."""
-    ok = [o for o in opts if o["fit"] == "comfortable"]
-    return ok[-1]["size"] if ok else ("0.9B" if opts[0]["fit"] != "too big" else None)
+# check
 
-
-def format_options(ram):
-    """For each format, the file size and fit of every size. The same 25% rule applies to full-quality GGUF."""
-    have = load_state().get("models") or {}
-    out = []
-    for fmt, (title, blurb) in FORMATS.items():
-        sizes = []
-        for size, m in MODELS.items():
-            key = model_key(size, fmt)
-            gb = m["gb"]["BF16"] if fmt == "gguf-bf16" else m["gb"][best_quant(size, ram)]
-            sizes.append({"size": size, "gb": gb, "fit": fit(gb, ram), "downloaded": bool(have.get(key, {}).get("verified"))})
-        out.append({"format": fmt, "title": title, "about": blurb, "sizes": sizes})
-    return out
-
-
-# ---------------------------------------------------------------- formats in the state file
-def model_key(size, fmt):
-    """State key for one downloaded model: "7B" (compressed GGUF) or "7B-bf16"."""
-    return {"gguf": size, "gguf-bf16": f"{size}-bf16"}[fmt]
-
-
-def key_size(key):
-    return key.split("-")[0]
-
-
-def key_format(key):
-    return {"bf16": "gguf-bf16"}.get(key.partition("-")[2], "gguf")
-
-
-def label(key):
-    """"7B" or "7B BF16 GGUF", for messages."""
-    extra = {"gguf": "", "gguf-bf16": " BF16 GGUF"}[key_format(key)]
-    return key_size(key) + extra
-
-
-# ---------------------------------------------------------------- check
 def cmd_check():
-    system, arch = platform.system(), platform.machine().lower()
     ram = total_ram_gb()
     free = shutil.disk_usage(home()).free / 1e9
     gpu = gpu_kind()
-    opts = options(ram)
-    rec = recommend(opts)
-    have = downloaded_sizes()
-    for o in opts:
-        o["already_downloaded"] = have.get(o["size"])
-    formats = format_options(ram)
-    info = {"os": system, "arch": arch, "ram_gb": round(ram, 1) if ram else None, "free_disk_gb": round(free, 1),
-            "gpu": gpu, "options": opts, "recommended_size": rec, "formats": formats, "default_format": "gguf", "dir": home()}
-    say(json.dumps(info, indent=1, ensure_ascii=False))
-    say()
-    say(f"Memory: {ram:.0f} GB · free disk: {free:.0f} GB · GPU: {gpu}" if ram else f"Free disk: {free:.0f} GB · GPU: {gpu}")
-    mark = {"comfortable": "✓ fits comfortably", "tight": "~ fits, but close other apps", "too big": "✗ too big", "unknown": "? unknown"}
-    for n, o in enumerate(opts, 1):   # always smallest → largest, so "the middle one" / "number 2" are unambiguous
-        dl = f"  [downloaded: {o['already_downloaded']}]" if o["already_downloaded"] else ""
-        say(f"  {n}. {o['size']:>5}  {o['quant']:<7} {o['file_gb']:>5.2f} GB  {mark[o['fit']]:<28} {o['speed_measured']}{dl}")
-    say(f"\nRecommended: {rec}" if rec else "\n⚠ Even 0.9B is a tight fit here.")
-    say("\nFormats (the list above uses a. GGUF, compressed, the default):")
-    sym = {"comfortable": "✓", "tight": "~", "too big": "✗", "unknown": "?"}
+    models = downloaded_models(load_state())
+
+    sizes = []
+    for size, m in MODELS.items():
+        quant = best_quant(size, ram)
+        done = models.get(size, {})
+        sizes.append({
+            "size": size,
+            "quant": quant,
+            "file_gb": m["gb"][quant],
+            "fit": fit(m["gb"][quant], ram),
+            "speed_measured": m["speed"],
+            "made_for": m["made_for"],
+            "good_at": m["good"],
+            "watch_out": m["weak"],
+            "already_downloaded": done.get("quant") if done.get("verified") and os.path.exists(done.get("path", "")) else None,
+        })
+
+    formats = []
+    for fmt, (title, about) in FORMATS.items():
+        fits = []
+        for size, m in MODELS.items():
+            gb = m["gb"]["BF16"] if fmt == "gguf-bf16" else m["gb"][best_quant(size, ram)]
+            done = bool(models.get(model_key(size, fmt), {}).get("verified"))
+            fits.append({"size": size, "gb": gb, "fit": fit(gb, ram), "downloaded": done})
+        formats.append({"format": fmt, "title": title, "about": about, "sizes": fits})
+
+    comfortable = [s["size"] for s in sizes if s["fit"] == "comfortable"]
+    if comfortable:
+        recommended = comfortable[-1]  # the biggest one that fits comfortably
+    elif sizes[0]["fit"] != "too big":
+        recommended = "0.9B"
+    else:
+        recommended = None
+
+    info = {
+        "os": platform.system(),
+        "arch": platform.machine().lower(),
+        "ram_gb": round(ram, 1) if ram else None,
+        "free_disk_gb": round(free, 1),
+        "gpu": gpu,
+        "options": sizes,
+        "recommended_size": recommended,
+        "formats": formats,
+        "default_format": "gguf",
+        "dir": home(),
+    }
+    print(json.dumps(info, indent=1, ensure_ascii=False))
+    print()
+
+    memory = f"Memory: {ram:.0f} GB, " if ram else ""
+    print(f"{memory}free disk: {free:.0f} GB, GPU: {gpu}")
+    marks = {"comfortable": "fits comfortably", "tight": "fits, close other apps",
+             "too big": "too big", "unknown": "unknown"}
+    # Smallest to largest, so "the middle one" or "2" is clear.
+    for n, s in enumerate(sizes, 1):
+        done = f"  [downloaded: {s['already_downloaded']}]" if s["already_downloaded"] else ""
+        print(f"  {n}. {s['size']:>5}  {s['quant']:<7} {s['file_gb']:>5.2f} GB  "
+              f"{marks[s['fit']]:<24} {s['speed_measured']}{done}")
+    print(f"\nRecommended: {recommended}" if recommended else "\nEven 0.9B is a tight fit here.")
+
+    print("\nFormats (the list above uses a, the default):")
     for letter, f in zip("ab", formats):
-        say(f"  {letter}. {f['title']}: {f['about']}")
-        if f["format"] != "gguf":
-            say("       " + " · ".join(f"{s['size']} {s['gb']:.1f} GB {sym[s['fit']]}" + (" [downloaded]" if s["downloaded"] else "")
-                                     for s in f["sizes"]))
-    for o in opts:
-        if o["fit"] != "too big" and free < o["file_gb"] + 1:
-            say(f"⚠ Not enough free disk for {o['size']} ({o['file_gb']:.1f} GB).")
-    if gpu == "none" and system != "Darwin":
-        say("ℹ No GPU found: models run on the CPU. That works, but expect them to be several times slower.")
+        print(f"  {letter}. {f['title']}: {f['about']}")
+        if f["format"] == "gguf-bf16":
+            print("     " + ", ".join(
+                f"{s['size']} {s['gb']:.1f} GB {marks[s['fit']]}" + (" [downloaded]" if s["downloaded"] else "")
+                for s in f["sizes"]))
+
+    for s in sizes:
+        if s["fit"] != "too big" and free < s["file_gb"] + 1:
+            print(f"Not enough free disk for {s['size']} ({s['file_gb']:.1f} GB).")
+    if gpu == "none" and platform.system() != "Darwin":
+        print("No GPU found, so the model runs on the CPU. It works, but several times slower.")
     save_state(check=info)
 
 
-# ---------------------------------------------------------------- install llama.cpp
+# install
+
 def latest_build():
-    """The newest llama.cpp release, from GitHub's /releases/latest redirect rather than the API: the API allows only
-    60 anonymous calls an hour per network, which a shared office network used up. Stable releases (v0.x) name their
-    build in nightly-tag.txt. None if it can't be found."""
+    # Follow the /releases/latest redirect instead of using the GitHub API: the API allows
+    # only 60 calls an hour per network, which a shared office network runs out of.
     try:
-        with urllib.request.urlopen(urllib.request.Request(f"{LLAMA_RELEASES}/latest", headers=UA), timeout=15) as r:
+        req = urllib.request.Request(f"{RELEASES}/latest", headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=15) as r:
             tag = r.geturl().rstrip("/").rsplit("/", 1)[-1]
         if not re.fullmatch(r"b\d+", tag):
-            with urllib.request.urlopen(urllib.request.Request(f"{LLAMA_RELEASES}/download/{tag}/nightly-tag.txt",
-                                                               headers=UA), timeout=15) as r:
+            # Stable releases are tagged v0.x and name their build in nightly-tag.txt.
+            req = urllib.request.Request(f"{RELEASES}/download/{tag}/nightly-tag.txt", headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=15) as r:
                 tag = r.read().decode().strip()
-        return tag if re.fullmatch(r"b\d+", tag) else None
     except Exception:
         return None
+    return tag if re.fullmatch(r"b\d+", tag) else None
 
 
-def fetch_llama(build, backend):
-    """Download this build's archives into the storage folder. The names follow a fixed pattern, so no API call is
-    needed. Returns the archive paths, or None if the build has no such file (404)."""
-    got = []
-    for name in choose_asset(build, backend):
-        url = f"{LLAMA_RELEASES}/download/{build}/{name}"
-        dest = os.path.join(home(), name)
-        say(f"Downloading {name} …")
-        try:
-            urllib.request.urlretrieve(url, dest)
-        except urllib.error.HTTPError as e:
-            for p in got:
-                os.remove(p)
-            if e.code == 404:
-                return None
-            raise SystemExit(f"✗ Couldn't download {url}: {e}")
-        except OSError as e:
-            raise SystemExit(f"✗ Couldn't download {url}: {e}. Check the internet connection and run install again.")
-        got.append(dest)
-    return got
-
-
-def choose_asset(build, backend):
-    system, arch = platform.system(), platform.machine().lower()
-    arm = arch in ("arm64", "aarch64")
+def archive_names(build, backend):
+    system = platform.system()
+    arm = platform.machine().lower() in ("arm64", "aarch64")
     b = build
     if system == "Darwin":
         return [f"llama-{b}-bin-macos-{'arm64' if arm else 'x64'}.tar.gz"]
     if system == "Linux":
         if arm:
             return [f"llama-{b}-bin-ubuntu-{'vulkan-arm64' if backend == 'vulkan' else 'arm64'}.tar.gz"]
-        return {"cuda": [f"llama-{b}-bin-ubuntu-cuda-12.8-x64.tar.gz", f"cudart-llama-{b}-bin-ubuntu-cuda-12.8-x64.tar.gz"],
-                "vulkan": [f"llama-{b}-bin-ubuntu-vulkan-x64.tar.gz"]}.get(backend, [f"llama-{b}-bin-ubuntu-x64.tar.gz"])
+        if backend == "cuda":
+            return [f"llama-{b}-bin-ubuntu-cuda-12.8-x64.tar.gz", f"cudart-llama-{b}-bin-ubuntu-cuda-12.8-x64.tar.gz"]
+        if backend == "vulkan":
+            return [f"llama-{b}-bin-ubuntu-vulkan-x64.tar.gz"]
+        return [f"llama-{b}-bin-ubuntu-x64.tar.gz"]
     if system == "Windows":
         if arm:
             return [f"llama-{b}-bin-win-{'vulkan' if backend == 'vulkan' else 'cpu'}-arm64.zip"]
-        return {"cuda": [f"llama-{b}-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"],
-                "vulkan": [f"llama-{b}-bin-win-vulkan-x64.zip"]}.get(backend, [f"llama-{b}-bin-win-cpu-x64.zip"])
-    raise SystemExit(f"Unsupported OS: {system}")
+        if backend == "cuda":
+            return [f"llama-{b}-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"]
+        if backend == "vulkan":
+            return [f"llama-{b}-bin-win-vulkan-x64.zip"]
+        return [f"llama-{b}-bin-win-cpu-x64.zip"]
+    sys.exit(f"Unsupported OS: {system}")
+
+
+def download_archives(build, backend):
+    """Returns the downloaded paths, or None if the release doesn't have these files."""
+    paths = []
+    for name in archive_names(build, backend):
+        url = f"{RELEASES}/download/{build}/{name}"
+        dest = os.path.join(home(), name)
+        print(f"Downloading {name} ...")
+        try:
+            urllib.request.urlretrieve(url, dest)
+        except urllib.error.HTTPError as e:
+            for p in paths:
+                os.remove(p)
+            if e.code == 404:
+                return None
+            sys.exit(f"Couldn't download {url}: {e}")
+        except OSError as e:
+            sys.exit(f"Couldn't download {url}: {e}. Check the internet connection and run install again.")
+        paths.append(dest)
+    return paths
 
 
 def find_server(root):
     exe = "llama-server.exe" if platform.system() == "Windows" else "llama-server"
-    for d, _, files in os.walk(root):
+    for folder, _, files in os.walk(root):
         if exe in files:
-            return os.path.join(d, exe)
+            return os.path.join(folder, exe)
     return None
 
 
 def cmd_install():
-    backend = ARGS.backend
-    if backend == "auto":
-        g = gpu_kind()
-        backend = {"nvidia": "cuda", "vulkan": "vulkan", "apple-metal": "metal"}.get(g, "cpu")  # macOS builds always include Metal
     if platform.system() == "Darwin":
-        backend = "metal" if platform.machine() == "arm64" else "cpu"   # macOS builds pick Metal themselves
+        backend = "metal" if platform.machine() == "arm64" else "cpu"  # the macOS builds include Metal
+    elif ARGS.backend == "auto":
+        backend = {"nvidia": "cuda", "vulkan": "vulkan"}.get(gpu_kind(), "cpu")
+    else:
+        backend = ARGS.backend
+
     root = os.path.join(home(), "llama")
-    st = load_state()
-    if find_server(root) and not ARGS.force and not ARGS.build:
-        say(f"✓ llama.cpp {st.get('build') or ''} already installed: {find_server(root)}"); return
-    build = {None: TESTED_BUILD, "tested": TESTED_BUILD, "latest": None}.get(ARGS.build, ARGS.build) or latest_build()
-    if not build:
-        raise SystemExit(f"✗ Couldn't look up the latest llama.cpp release at {LLAMA_RELEASES}/latest. "
-                         "Check the internet connection and run install again.")
-    if find_server(root) and build == st.get("build") and not ARGS.force:
-        say(f"✓ llama.cpp {build} already installed: {find_server(root)}"); return
-    if find_server(root) and pid_alive(st.get("pid")):
-        raise SystemExit("The model is running from the installed llama.cpp. Run stop first, then install again.")
-    archives = fetch_llama(build, backend)
+    state = load_state()
+    installed = find_server(root)
+    if installed and not ARGS.force and not ARGS.build:
+        print(f"llama.cpp {state.get('build') or ''} is already installed: {installed}")
+        return
+
+    if ARGS.build in (None, "tested"):
+        build = TESTED_BUILD
+    elif ARGS.build == "latest":
+        build = latest_build()
+        if not build:
+            sys.exit(f"Couldn't look up the latest llama.cpp release at {RELEASES}/latest. "
+                     "Check the internet connection and run install again.")
+    else:
+        build = ARGS.build
+
+    if installed and build == state.get("build") and not ARGS.force:
+        print(f"llama.cpp {build} is already installed: {installed}")
+        return
+    if installed and pid_alive(state.get("pid")):
+        sys.exit("The model is running from the installed llama.cpp. Run stop first, then install again.")
+
+    archives = download_archives(build, backend)
     if not archives:
-        raise SystemExit(f"✗ llama.cpp {build} has no {' + '.join(choose_asset(build, backend))}. "
-                         f"See {LLAMA_RELEASES} or try --backend cpu.")
-    shutil.rmtree(root, ignore_errors=True)   # an update must not leave the old llama-server next to the new one
+        sys.exit(f"llama.cpp {build} has no {' + '.join(archive_names(build, backend))}. "
+                 f"See {RELEASES} or try --backend cpu.")
+
+    # Start clean, so an old llama-server isn't left next to the new one.
+    shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root)
-    for dest in archives:
-        if dest.endswith(".zip"):
-            zipfile.ZipFile(dest).extractall(root)
+    for path in archives:
+        if path.endswith(".zip"):
+            with zipfile.ZipFile(path) as z:
+                z.extractall(root)
         else:
-            with tarfile.open(dest) as t:
+            with tarfile.open(path) as t:
                 t.extractall(root)
-        os.remove(dest)
+        os.remove(path)
+
     server = find_server(root)
     if not server:
-        raise SystemExit("Unpacked llama.cpp but couldn't find llama-server. Look inside " + root)
+        sys.exit(f"Unpacked llama.cpp but couldn't find llama-server. Look inside {root}")
     if platform.system() != "Windows":
-        for d, _, files in os.walk(os.path.dirname(server)):
-            for f in files:
-                p = os.path.join(d, f)
-                os.chmod(p, os.stat(p).st_mode | 0o111)
+        for folder, _, files in os.walk(os.path.dirname(server)):
+            for name in files:
+                path = os.path.join(folder, name)
+                os.chmod(path, os.stat(path).st_mode | 0o111)
     if platform.system() == "Darwin":
-        subprocess.run(["xattr", "-dr", "com.apple.quarantine", root], stderr=subprocess.DEVNULL)  # macOS blocks downloaded binaries otherwise
+        # Otherwise macOS refuses to run the downloaded binaries.
+        subprocess.run(["xattr", "-dr", "com.apple.quarantine", root], stderr=subprocess.DEVNULL)
+
     out = subprocess.run([server, "--version"], capture_output=True, text=True)
-    say((out.stdout + out.stderr).strip().splitlines()[0] if (out.stdout + out.stderr).strip() else "(no version output)")
+    version = (out.stdout + out.stderr).strip()
+    print(version.splitlines()[0] if version else "(no version output)")
     save_state(server=server, backend=backend, build=build)
     if build == TESTED_BUILD:
-        say(f"✓ llama.cpp {build} ({backend}) installed, the build tested with K2 Horizon.")
+        print(f"Installed llama.cpp {build} ({backend}), the build tested with K2 Horizon.")
     else:
-        say(f"✓ llama.cpp {build} ({backend}) installed. It hasn't been tested with K2 Horizon; "
-            f"if anything misbehaves, go back with: install --build tested")
+        print(f"Installed llama.cpp {build} ({backend}). It hasn't been tested with K2 Horizon; "
+              "if anything misbehaves, go back with: install --build tested")
 
 
-# ---------------------------------------------------------------- download the model
-def filename_note(size):
-    return {"0.9B": " (IFM names the 0.9B file \"1B\")", "3.7B": " (IFM names the 3.7B file \"4B\")"}.get(size, "")
+# download
 
-
-def downloaded_sizes():
-    """Compressed GGUF downloads only, size -> quant (check's main list is about those)."""
-    out = {}
-    for key, m in (load_state().get("models") or {}).items():
-        if key_format(key) == "gguf" and m.get("verified") and os.path.exists(m.get("path", "")):
-            out[key] = m.get("quant")
-    return out
-
-
-def run_hint(py=None):
-    """The exact command the user should type later, including --dir if it isn't the default."""
-    script = os.path.abspath(__file__)
-    py = py or ("py" if platform.system() == "Windows" else "python3")
-    d = home()
-    extra = "" if d == os.path.expanduser("~/k2-horizon-local") else f' --dir "{d}"'
-    port = "" if ARGS.port == PORT else f" --port {ARGS.port}"
-    return f'{py} "{script}"{extra}{port}'
-
-
-def record_model(key, **kw):
-    st = load_state()
-    models = st.get("models") or {}
-    models[key] = {**models.get(key, {}), **kw}
-    save_state(models=models, active=key)
-
-
-def fetch_file(url, dest, total, sha=None):
-    """Download one file with 8 parallel ranges, resuming whatever is already there, then check its sha256."""
+def fetch_file(url, dest, total, sha256):
+    """Download in 8 parallel parts (a single connection kept stalling), resuming
+    whatever is already there, then check the size and checksum."""
     keep_awake()
     have = os.path.getsize(dest) if os.path.exists(dest) else 0
     if have > total:
-        os.remove(dest); have = 0
-    say(f"Downloading {os.path.basename(dest)}: {total / 1e9:.2f} GB ({have / 1e9:.2f} GB already here)")
+        os.remove(dest)
+        have = 0
+    name = os.path.basename(dest)
+    print(f"Downloading {name}: {total / 1e9:.2f} GB ({have / 1e9:.2f} GB already here)")
 
-    parts = 8                      # parallel ranges: a single connection kept stalling in our tests
-    remaining = total - have
-    bounds = [(have + remaining * i // parts, have + remaining * (i + 1) // parts - 1) for i in range(parts)] if remaining else []
-    got = [0] * len(bounds)
-    errors = []
+    parts = 8
+    left = total - have
+    ranges = []
+    if left:
+        ranges = [(have + left * i // parts, have + left * (i + 1) // parts - 1) for i in range(parts)]
+    progress = [0] * len(ranges)
+    failed = []
 
-    def worker(i, start, end):
+    def download_part(i, start, end):
         part = f"{dest}.part{i}"
         for attempt in range(40):
-            size = os.path.getsize(part) if os.path.exists(part) else 0
-            if start + size > end:
+            done = os.path.getsize(part) if os.path.exists(part) else 0
+            if start + done > end:
                 return
             try:
-                req = urllib.request.Request(url, headers={**UA, "Range": f"bytes={start + size}-{end}"})
+                req = urllib.request.Request(url, headers={**HEADERS, "Range": f"bytes={start + done}-{end}"})
                 with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab") as f:
-                    while True:
-                        chunk = r.read(1 << 20)
-                        if not chunk:
-                            break
-                        f.write(chunk); got[i] = os.path.getsize(part)
+                    for chunk in iter(lambda: r.read(1 << 20), b""):
+                        f.write(chunk)
+                        progress[i] = f.tell()
             except Exception:
                 time.sleep(min(30, 2 + attempt * 2))
-        errors.append(i)
+        failed.append(i)
 
-    threads = [threading.Thread(target=worker, args=(i, s, e), daemon=True) for i, (s, e) in enumerate(bounds)]
+    threads = [threading.Thread(target=download_part, args=(i, start, end), daemon=True)
+               for i, (start, end) in enumerate(ranges)]
     for t in threads:
         t.start()
-    last, t_last = sum(got), time.time()
+    last, last_time = 0, time.time()
     while any(t.is_alive() for t in threads):
-        for _ in range(15):        # report every 15 s, but notice a finished small file right away
+        for _ in range(15):  # report every 15 seconds
             time.sleep(1)
             if not any(t.is_alive() for t in threads):
                 break
-        now, t_now = sum(got), time.time()
-        say(f"  {(have + now) / 1e9:5.2f} / {total / 1e9:.2f} GB · {(now - last) / (t_now - t_last) / 1e6:5.1f} MB/s")
-        last, t_last = now, t_now
-    if errors:
-        raise SystemExit("Some parts failed after many retries. Run the same command again: it resumes.")
+        now = sum(progress)
+        speed = (now - last) / (time.time() - last_time) / 1e6
+        print(f"  {(have + now) / 1e9:5.2f} / {total / 1e9:.2f} GB, {speed:5.1f} MB/s")
+        last, last_time = now, time.time()
+    if failed:
+        sys.exit("Some parts failed after many retries. Run the same command again to resume.")
+
     with open(dest, "ab") as out:
-        for i in range(len(bounds)):
+        for i in range(len(ranges)):
             part = f"{dest}.part{i}"
-            with open(part, "rb") as p:
-                shutil.copyfileobj(p, out, 1 << 24)
+            with open(part, "rb") as f:
+                shutil.copyfileobj(f, out, 1 << 24)
             os.remove(part)
-    if sha:
-        say("Verifying checksum against Hugging Face …")
-        h = hashlib.sha256()
-        with open(dest, "rb") as f:
-            for b in iter(lambda: f.read(1 << 24), b""):
-                h.update(b)
-        if os.path.getsize(dest) != total or h.hexdigest() != sha:
-            os.rename(dest, dest + ".bad")
-            raise SystemExit(f"✗ Checksum mismatch in {os.path.basename(dest)}. The damaged file was renamed to .bad. Run download again.")
-    elif os.path.getsize(dest) != total:
-        os.remove(dest)
-        raise SystemExit(f"✗ {os.path.basename(dest)} came out the wrong size. Run download again.")
+
+    print("Checking the checksum against Hugging Face ...")
+    h = hashlib.sha256()
+    with open(dest, "rb") as f:
+        for block in iter(lambda: f.read(1 << 24), b""):
+            h.update(block)
+    if os.path.getsize(dest) != total or h.hexdigest() != sha256:
+        os.rename(dest, dest + ".bad")
+        sys.exit(f"Checksum mismatch in {name}. The damaged file was renamed to .bad. Run download again.")
 
 
 def cmd_download():
     size = ARGS.size
     if not size:
-        raise SystemExit("Choose a size: download --size 0.9B | 3.7B | 7B   (run check to see what fits)")
-    fmt = "gguf-bf16" if ARGS.quant == "BF16" else ARGS.format
-    if fmt == "gguf-bf16" and ARGS.quant not in (None, "BF16"):
-        raise SystemExit("--format gguf-bf16 is the BF16 file; leave out --quant (or use --format gguf with it).")
-    m = MODELS[size]
+        sys.exit("Choose a size: download --size 0.9B | 3.7B | 7B   (run check to see what fits)")
+    quant = pick_quant(size)
+    fmt = "gguf-bf16" if quant == "BF16" else "gguf"
     key = model_key(size, fmt)
-    quant = "BF16" if fmt == "gguf-bf16" else ARGS.quant or best_quant(size, total_ram_gb())
-    name = f"{m['prefix']}-{quant}.gguf"
+    repo = MODELS[size]["repo"]
+    name = f"{MODELS[size]['prefix']}-{quant}.gguf"
     dest = os.path.join(home(), name)
-    prev = (load_state().get("models") or {}).get(key, {})
+    note = {"0.9B": ' (IFM names the 0.9B file "1B")', "3.7B": ' (IFM names the 3.7B file "4B")'}.get(size, "")
+
+    models = downloaded_models(load_state())
+    prev = models.get(key, {})
     if prev.get("verified") == name and os.path.exists(dest) and os.path.getsize(dest) == prev.get("verified_size"):
-        say(f"✓ {label(key)} already downloaded and verified (sha256 checked when it was downloaded): {dest}" + filename_note(size))
-        record_model(key, path=dest, quant=quant); return
-    meta = next(f for f in fetch_json(f"https://huggingface.co/api/models/{m['repo']}/tree/main") if f["path"] == name)
-    total, sha = meta["lfs"]["size"], meta["lfs"]["oid"]
-    fetch_file(f"https://huggingface.co/{m['repo']}/resolve/main/{name}", dest, total, sha)
-    record_model(key, path=dest, quant=quant, verified=name, verified_size=total)
-    fmt_flag = "" if fmt == "gguf" else f" --format {fmt}"
-    say(f"✓ Verified {name} (sha256 matches Hugging Face).{filename_note(size)} Start it with: serve --size {size}{fmt_flag}")
+        print(f"{label(key)} is already downloaded and verified: {dest}{note}")
+    else:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"https://huggingface.co/api/models/{repo}/tree/main", headers=HEADERS), timeout=60) as r:
+            files = {f["path"]: f for f in json.loads(r.read())}
+        if name not in files:
+            sys.exit(f"{name} isn't in {repo} on Hugging Face.")
+        total, sha256 = files[name]["lfs"]["size"], files[name]["lfs"]["oid"]
+        fetch_file(f"https://huggingface.co/{repo}/resolve/main/{name}", dest, total, sha256)
+        prev = {"verified": name, "verified_size": total}
+        flag = " --format gguf-bf16" if fmt == "gguf-bf16" else ""
+        print(f"Verified {name} (sha256 matches Hugging Face).{note} Start it with: serve --size {size}{flag}")
+
+    state = load_state()
+    all_models = state.get("models") or {}
+    all_models[key] = {**prev, "path": dest, "quant": quant}
+    save_state(models=all_models, active=key)
 
 
-# ---------------------------------------------------------------- serve / stop / status
+# serve, stop, status
+
 def pid_alive(pid):
     if not pid:
         return False
@@ -495,13 +578,13 @@ def pid_alive(pid):
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True).stdout
         return str(pid) in out
     try:
-        os.kill(pid, 0); return True
+        os.kill(pid, 0)
+        return True
     except OSError:
         return False
 
 
 def port_in_use():
-    import socket
     with socket.socket() as s:
         s.settimeout(1)
         return s.connect_ex(("127.0.0.1", ARGS.port)) == 0
@@ -515,16 +598,17 @@ def healthy():
         return False
 
 
-def gguf_models(st):
-    """Downloaded models, leaving out "-original" entries that older versions of this script could record."""
-    return {k: v for k, v in (st.get("models") or {}).items() if not k.endswith("-original")}
+def background_flags():
+    if platform.system() == "Windows":
+        DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP = 0x00000008, 0x00000200
+        return {"creationflags": DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
 
 
-def pick_key(st):
-    """Which downloaded model to serve. --format wins; otherwise the last one used for that size,
-    then compressed GGUF, then BF16 GGUF."""
-    models = gguf_models(st)
-    active = st.get("active") if st.get("active") in models else None
+def pick_model(state):
+    """--format if given, otherwise the last one used for that size, then compressed, then BF16."""
+    models = downloaded_models(state)
+    active = state.get("active") if state.get("active") in models else None
     size = ARGS.size or (key_size(active) if active else None)
     if not size:
         return None
@@ -532,69 +616,75 @@ def pick_key(st):
         return model_key(size, ARGS.format)
     if active and key_size(active) == size:
         return active
-    return next((k for k in (size, f"{size}-bf16") if k in models), size)
+    return size if size in models or f"{size}-bf16" not in models else f"{size}-bf16"
+
+
+def print_usage_hints():
+    hint = command_hint()
+    print(f"  Web chat: http://127.0.0.1:{ARGS.port}  (open it in a browser)")
+    print(f"  Chat: {hint} chat")
+    print(f'  Ask:  {hint} ask "your question"')
+    print(f"  Stop: {hint} stop")
 
 
 def cmd_serve():
-    st = load_state()
-    models = gguf_models(st)
-    key = pick_key(st)
+    state = load_state()
+    models = downloaded_models(state)
+    key = pick_model(state)
     if not key or key not in models or not os.path.exists(models[key].get("path", "")):
         have = ", ".join(label(k) for k in models) or "none"
         size = key_size(key) if key else "3.7B"
-        fmt_flag = f" --format {key_format(key)}" if key and key_format(key) != "gguf" else ""
-        raise SystemExit(f"{label(key) if key else 'That size'} isn't downloaded yet (downloaded: {have}). "
-                         f"Run: download --size {size}{fmt_flag}")
-    if not st.get("server") or not os.path.exists(st["server"]):
-        raise SystemExit("llama.cpp isn't installed yet. Run: install")
-    model = models[key]["path"]
+        flag = " --format gguf-bf16" if key and key_format(key) == "gguf-bf16" else ""
+        sys.exit(f"{label(key) if key else 'That size'} isn't downloaded yet (downloaded: {have}). "
+                 f"Run: download --size {size}{flag}")
+    server = state.get("server")
+    if not server or not os.path.exists(server):
+        sys.exit("llama.cpp isn't installed yet. Run: install")
+
     if port_in_use():
-        if pid_alive(st.get("pid")) and healthy():
-            if st.get("serving") == key:
-                say(f"✓ {label(key)} is already running at http://127.0.0.1:{ARGS.port}")
-                return say_how_to_use()
-            raise SystemExit(f"{label(st.get('serving') or '?')} is running. Run stop first, then serve again.")
-        raise SystemExit(f"✗ Port {ARGS.port} is used by another program. Stop it, or pick another port: --port 8081 (use it with ask too).")
-    server = st["server"]
-    log = open(os.path.join(home(), "server.log"), "w")
-    # llama.cpp recognizes K2 Horizon's tags: replies come back as reasoning_content, content and tool_calls.
-    # IFM's recommended settings become the defaults for every client, the web chat and other apps included:
-    # high reasoning, top_p 0.95, temperature 1.0 (0.6 for 0.9B). A request can still set its own.
-    temp = MODELS[key_size(key)]["temp"]
-    cmd = [server, "-m", model, "--host", "127.0.0.1", "--port", str(ARGS.port), "--jinja",
-           "-c", str(ARGS.ctx), "-ngl", "99", "--temp", str(temp), "--top-p", "0.95",
-           "--chat-template-kwargs", json.dumps({"reasoning_effort": "high"})]
-    kw = {"stdout": log, "stderr": log, "cwd": os.path.dirname(server)}
-    if platform.system() == "Windows":
-        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    else:
-        kw["start_new_session"] = True
-    proc = subprocess.Popen(cmd, **kw)
+        if pid_alive(state.get("pid")) and healthy():
+            if state.get("serving") == key:
+                print(f"{label(key)} is already running at http://127.0.0.1:{ARGS.port}")
+                print_usage_hints()
+                return
+            sys.exit(f"{label(state.get('serving') or '?')} is running. Run stop first, then serve again.")
+        sys.exit(f"Port {ARGS.port} is used by another program. Stop it, or use another port: "
+                 "--port 8081 (with ask and chat too).")
+
+    # IFM's recommended settings, set on the server so the web chat and other apps get them too.
+    # --jinja lets llama.cpp split the replies into reasoning, answer and tool calls.
+    cmd = [
+        server, "-m", models[key]["path"], "--host", "127.0.0.1", "--port", str(ARGS.port),
+        "--jinja", "-c", str(ARGS.ctx), "-ngl", "99",
+        "--temp", str(MODELS[key_size(key)]["temp"]), "--top-p", "0.95",
+        "--chat-template-kwargs", json.dumps({"reasoning_effort": "high"}),
+    ]
+    log_path = os.path.join(home(), "server.log")
+    with open(log_path, "w") as log:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=log, cwd=os.path.dirname(server), **background_flags())
     save_state(pid=proc.pid, port=ARGS.port, serving=key, active=key)
-    say(f"Starting K2-Horizon-{label(key)} (pid {proc.pid}) …")
-    t0 = time.time()
-    while time.time() - t0 < 900:   # first load of a big file can be slow
+    print(f"Starting K2-Horizon-{label(key)} (pid {proc.pid}) ...")
+
+    start = time.time()
+    while time.time() - start < 900:  # the first load of a big file can be slow
         if proc.poll() is not None:
-            tail = open(os.path.join(home(), "server.log")).read()[-1500:]
-            raise SystemExit("✗ The server stopped while loading. Last log lines:\n" + tail)
+            with open(log_path) as f:
+                sys.exit("The server stopped while loading. Last log lines:\n" + f.read()[-1500:])
         if healthy():
-            say(f"✓ {label(key)} ready in {time.time() - t0:.0f}s at http://127.0.0.1:{ARGS.port}  (OpenAI-compatible API at /v1)")
-            return say_how_to_use()
+            print(f"{label(key)} is ready after {time.time() - start:.0f}s at http://127.0.0.1:{ARGS.port} "
+                  "(OpenAI-compatible API at /v1)")
+            print_usage_hints()
+            return
         time.sleep(1)
-    raise SystemExit("✗ Still not ready after 15 minutes. Check server.log; the computer may be out of memory.")
-
-
-def say_how_to_use():
-    """The ways to talk to the running model. llama-server also serves a chat page at its address."""
-    h = run_hint()
-    say(f"  Web chat: http://127.0.0.1:{ARGS.port}  (open it in a browser)")
-    say(f"  Chat: {h} chat\n  Ask:  {h} ask \"your question\"\n  Stop: {h} stop")
+    sys.exit("Still not ready after 15 minutes. Check server.log; the computer may be out of memory.")
 
 
 def cmd_stop():
     pid = load_state().get("pid")
-    if not pid or not pid_alive(pid):
-        save_state(pid=None); say("Nothing running."); return
+    if not pid_alive(pid):
+        save_state(pid=None)
+        print("Nothing running.")
+        return
     if platform.system() == "Windows":
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
     else:
@@ -607,32 +697,40 @@ def cmd_stop():
             os.kill(pid, signal.SIGKILL)
     time.sleep(0.5)
     if pid_alive(pid):
-        raise SystemExit(f"✗ Couldn't stop pid {pid}. Close it manually.")
+        sys.exit(f"Couldn't stop pid {pid}. Close it manually.")
     save_state(pid=None, serving=None)
-    say(f"✓ Stopped (pid {pid}); port {ARGS.port} is free." if not port_in_use() else f"✓ Stopped pid {pid}, but something else still uses port {ARGS.port}.")
+    if port_in_use():
+        print(f"Stopped pid {pid}, but something else still uses port {ARGS.port}.")
+    else:
+        print(f"Stopped (pid {pid}); port {ARGS.port} is free.")
 
 
 def cmd_status():
-    st = load_state()
-    say(json.dumps({k: st.get(k) for k in ("server", "build", "backend", "models", "active", "serving", "pid", "port")}, indent=1))
-    say(f"running ✓ ({st.get('serving')})" if healthy() else "not running")
+    state = load_state()
+    keys = ("server", "build", "backend", "models", "active", "serving", "pid", "port")
+    print(json.dumps({k: state.get(k) for k in keys}, indent=1))
+    print(f"running ({state.get('serving')})" if healthy() else "not running")
 
 
-# ---------------------------------------------------------------- ask
+# ask and chat
+
 THINK_END = re.compile(r"</ifm\|think\w*>")
 
 
 def read_message(m):
-    """(thinking, answer, tool_calls) from a reply message. The server already splits K2 Horizon's reasoning,
-    answer and tool calls. One exception, seen with 3.7B at medium effort: it opens with <ifm|think_fast> but closes
-    with </ifm|think>, so the server never finds the end and returns everything as reasoning, with an empty answer.
-    The wrong tag stays in the text, so split it here."""
-    reasoning, content = m.get("reasoning_content") or "", m.get("content") or ""
+    """Return (thinking, answer, tool_calls) from a reply.
+
+    llama.cpp normally splits these already. But 3.7B at medium effort opens with
+    <ifm|think_fast> and closes with </ifm|think>, so the server never sees the end of
+    the thinking and puts the whole reply in reasoning_content. Split it here instead.
+    """
+    reasoning = m.get("reasoning_content") or ""
+    content = m.get("content") or ""
     if THINK_END.search(reasoning) or "<ifm|" in content:
         return split_output(reasoning + content)
     calls = []
-    for c in m.get("tool_calls") or []:
-        fn = c.get("function") or {}
+    for call in m.get("tool_calls") or []:
+        fn = call.get("function") or {}
         try:
             args = json.loads(fn.get("arguments") or "{}")
         except ValueError:
@@ -642,100 +740,66 @@ def read_message(m):
 
 
 def split_output(raw):
-    """Split raw K2 Horizon text into (thinking, answer, tool_calls). Accepts any closing tag (<ifm|think>,
-    <ifm|think_fast>, …), which also covers 3.7B's mismatched medium tag, and parses <ifm|tool_call> blocks."""
+    """Split raw K2 Horizon text into (thinking, answer, tool_calls)."""
     parts = THINK_END.split(raw, maxsplit=1)
     thinking, answer = (parts[0], parts[1]) if len(parts) == 2 else ("", raw)
     thinking = re.sub(r"<ifm\|think\w*>", "", thinking)
     calls = []
     for name, body in re.findall(r"<ifm\|tool_call>\s*([\w.\-]+)(.*?)</ifm\|tool_call>", answer, re.S):
-        args = {k.strip(): v.strip() for k, v in re.findall(
-            r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*<ifm\|arg_value>(.*?)</ifm\|arg_value>", body, re.S)}
-        calls.append({"name": name, "arguments": args})
+        pairs = re.findall(r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*<ifm\|arg_value>(.*?)</ifm\|arg_value>", body, re.S)
+        calls.append({"name": name, "arguments": {k.strip(): v.strip() for k, v in pairs}})
     answer = re.sub(r"<ifm\|tool_calls>.*?(</ifm\|tool_calls>|$)", "", answer, flags=re.S)
     answer = re.sub(r"</?ifm\|think\w*>", "", answer).strip()
     return thinking.strip(), answer, calls
 
 
+def chat_request(messages, effort, stream=False):
+    serving = load_state().get("serving")
+    temp = MODELS[key_size(serving)]["temp"] if serving else 1.0
+    body = {
+        "messages": messages,
+        "temperature": temp,
+        "top_p": 0.95,
+        "stream": stream,
+        "chat_template_kwargs": {"reasoning_effort": effort},
+    }
+    # No limit by default: at high effort the thinking alone can run to thousands of tokens.
+    if ARGS.max_tokens:
+        body["max_tokens"] = ARGS.max_tokens
+    req = urllib.request.Request(f"http://127.0.0.1:{ARGS.port}/v1/chat/completions",
+                                 data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    return urllib.request.urlopen(req, timeout=900)
+
+
 def cmd_ask():
     if not healthy():
-        raise SystemExit("The model isn't running. Run: serve")
-    key = load_state().get("serving")
-    size = label(key) if key else None
-    temp = MODELS.get(key_size(key) if key else "", {}).get("temp", 1.0)   # IFM: 0.6 for 0.9B, 1.0 for the others
-    body = {"messages": [{"role": "user", "content": ARGS.prompt}], "temperature": temp, "top_p": 0.95,
-            "chat_template_kwargs": {"reasoning_effort": ARGS.effort}, **max_tokens()}
-    req = urllib.request.Request(f"http://127.0.0.1:{ARGS.port}/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    t0 = time.time()
-    with urllib.request.urlopen(req, timeout=900) as r:
+        sys.exit("The model isn't running. Run: serve")
+    start = time.time()
+    with chat_request([{"role": "user", "content": ARGS.prompt}], ARGS.effort) as r:
         res = json.loads(r.read())
-    m = res["choices"][0]["message"]
-    thinking, answer, calls = read_message(m)
+    thinking, answer, calls = read_message(res["choices"][0]["message"])
     if ARGS.show_thinking and thinking:
-        say("── thinking ──\n" + thinking + "\n")
-    say("── answer ──\n" + (answer or "(empty)"))
-    for c in calls:
-        say(f"── tool call ── {c['name']}({json.dumps(c['arguments'], ensure_ascii=False)})")
+        print("-- thinking --\n" + thinking + "\n")
+    print("-- answer --\n" + (answer or "(empty)"))
+    for call in calls:
+        print(f"-- tool call -- {call['name']}({json.dumps(call['arguments'], ensure_ascii=False)})")
+
+    serving = load_state().get("serving")
+    tokens = res.get("usage", {}).get("completion_tokens", "?")
+    line = f"\n{label(serving) if serving else 'model'}, {time.time() - start:.1f}s, {tokens} tokens"
     tps = res.get("timings", {}).get("predicted_per_second")
-    say(f"\n{size or 'model'} · {time.time() - t0:.1f}s · {res.get('usage', {}).get('completion_tokens', '?')} tokens" + (f" · {tps:.0f} tokens/s" if tps else ""))
+    if tps:
+        line += f", {tps:.0f} tokens/s"
+    print(line)
 
 
-def max_tokens():
-    """No limit by default: high reasoning can think for thousands of tokens, and a cap cut off answers."""
-    return {"max_tokens": ARGS.max_tokens} if ARGS.max_tokens else {}
-
-
-# ---------------------------------------------------------------- chat
-def cmd_chat():
-    if not healthy():
-        raise SystemExit("The model isn't running. Run: serve")
-    if ARGS.window:
-        return open_chat_window()
-    try:
-        import readline   # arrow keys and history while typing; not available on Windows
-    except ImportError:
-        pass
-    key = load_state().get("serving")
-    temp = MODELS.get(key_size(key) if key else "", {}).get("temp", 1.0)
-    effort = ARGS.effort
-    say(f"K2 Horizon {label(key) if key else ''} · {effort} thinking · runs privately on this computer")
-    say("Type a message and press Enter. /new starts over, /effort low|medium|high changes the thinking, /exit quits.\n")
-    history = []
-    while True:
-        try:
-            text = input("you › ").strip()
-        except (EOFError, KeyboardInterrupt):
-            say(); break
-        if not text:
-            continue
-        if text in ("/exit", "/quit", "exit", "quit"):
-            break
-        if text == "/new":
-            history = []; say("(started over)\n"); continue
-        if text.startswith("/effort"):
-            v = text.split()[1:]
-            if v and v[0] in ("low", "medium", "high"):
-                effort = v[0]; say(f"(thinking: {effort})\n")
-            else:
-                say("Use /effort low, /effort medium or /effort high\n")
-            continue
-        history.append({"role": "user", "content": text})
-        try:
-            history.append({"role": "assistant", "content": stream_reply(history, temp, effort)})
-        except KeyboardInterrupt:
-            history.pop(); say("\n(stopped)\n")
-
-
-def stream_reply(messages, temp, effort):
-    """Print the answer as it arrives and return it. While the model thinks, show a 'thinking…' placeholder."""
-    body = {"messages": messages, "temperature": temp, "top_p": 0.95, "stream": True,
-            "chat_template_kwargs": {"reasoning_effort": effort}, **max_tokens()}
-    req = urllib.request.Request(f"http://127.0.0.1:{ARGS.port}/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    reasoning, content, thinking, started, tps = "", "", False, False, None
+def stream_reply(messages, effort):
+    """Print the answer as it streams in and return it. Shows "thinking..." until the answer starts."""
     out = sys.stdout
-    with urllib.request.urlopen(req, timeout=900) as r:
+    reasoning, content, tps = "", "", None
+    thinking_shown = answer_started = False
+    clear = "\r" + " " * 20 + "\r"
+    with chat_request(messages, effort, stream=True) as r:
         for line in r:
             line = line.decode("utf-8", "replace").strip()
             if not line.startswith("data:") or line == "data: [DONE]":
@@ -745,181 +809,267 @@ def stream_reply(messages, temp, effort):
             delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
             if delta.get("reasoning_content"):
                 reasoning += delta["reasoning_content"]
-                if not thinking and not started:
-                    out.write("k2 › thinking…"); out.flush(); thinking = True
+                if not thinking_shown and not answer_started:
+                    out.write("k2 > thinking...")
+                    out.flush()
+                    thinking_shown = True
             if delta.get("content"):
-                if not started:
-                    out.write(("\r" + " " * 20 + "\r" if thinking else "") + "k2 › "); started = True
-                content += delta["content"]; out.write(delta["content"]); out.flush()
+                if not answer_started:
+                    out.write((clear if thinking_shown else "") + "k2 > ")
+                    answer_started = True
+                content += delta["content"]
+                out.write(delta["content"])
+                out.flush()
     _, answer, _ = read_message({"reasoning_content": reasoning, "content": content})
-    if not started:   # 3.7B at medium effort: the whole reply arrives as reasoning (see read_message)
-        out.write(("\r" + " " * 20 + "\r" if thinking else "") + "k2 › " + (answer or "(empty)"))
-    say(f"\n   ({tps:.0f} tokens/s)\n" if tps else "\n")
+    if not answer_started:  # 3.7B at medium effort, see read_message
+        out.write((clear if thinking_shown else "") + "k2 > " + (answer or "(empty)"))
+    print(f"\n   ({tps:.0f} tokens/s)\n" if tps else "\n")
     return answer
 
 
-def open_chat_window():
-    """Start the chat in a new terminal window, so an assistant that runs commands in the background can hand the
-    user a chat they can type into."""
-    py = f'"{sys.executable}"'   # the Python running now, in case python3 isn't on the new window's PATH
-    ok = open_in_window(f"{run_hint(py)} chat --effort {ARGS.effort}", "chat")
-    say("✓ Opened the chat in a new terminal window." if ok else "✗ Couldn't open a terminal window on this computer.")
-    say(f"  To start it yourself, run in a terminal: {run_hint()} chat")
+def cmd_chat():
+    if not healthy():
+        sys.exit("The model isn't running. Run: serve")
+    if ARGS.window:
+        # Use this same Python, in case python3 isn't on the new window's PATH.
+        python = f'"{sys.executable}"'
+        opened = open_in_window(f"{command_hint(python)} chat --effort {ARGS.effort}", "chat")
+        print("Opened the chat in a new terminal window." if opened else "Couldn't open a terminal window on this computer.")
+        print(f"  To start it yourself, run in a terminal: {command_hint()} chat")
+        return
+    try:
+        import readline  # noqa: F401  (arrow keys and history; not on Windows)
+    except ImportError:
+        pass
+
+    serving = load_state().get("serving")
+    effort = ARGS.effort
+    print(f"K2 Horizon {label(serving) if serving else ''}, {effort} thinking, running on this computer")
+    print("Type a message and press Enter. /new starts over, /effort low|medium|high changes the thinking, /exit quits.\n")
+    history = []
+    while True:
+        try:
+            text = input("you > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not text:
+            continue
+        if text in ("/exit", "/quit", "exit", "quit"):
+            break
+        if text == "/new":
+            history = []
+            print("(started over)\n")
+            continue
+        if text.startswith("/effort"):
+            choice = text.split()[1:]
+            if choice and choice[0] in EFFORTS:
+                effort = choice[0]
+                print(f"(thinking: {effort})\n")
+            else:
+                print("Use /effort low, /effort medium or /effort high\n")
+            continue
+        history.append({"role": "user", "content": text})
+        try:
+            history.append({"role": "assistant", "content": stream_reply(history, effort)})
+        except KeyboardInterrupt:
+            history.pop()
+            print("\n(stopped)\n")
 
 
 def open_in_window(cmd, name, folder=None):
-    """Run a command in a new terminal window, optionally from a folder. True if a window opened."""
+    """Run a command in a new terminal window. Returns True if a window opened."""
     system = platform.system()
     if system == "Darwin":
-        path = os.path.join(home(), f"{name}.command")   # Terminal opens .command files; no extra permission needed
+        # Terminal opens .command files without asking for any extra permission.
+        path = os.path.join(home(), f"{name}.command")
         with open(path, "w") as f:
-            f.write("#!/bin/sh\nclear\n" + (f'cd "{folder}"\n' if folder else "") + f"{cmd}\n")
+            f.write("#!/bin/sh\nclear\n" + (f'cd "{folder}"\n' if folder else "") + cmd + "\n")
         os.chmod(path, 0o755)
         return subprocess.run(["open", path]).returncode == 0
     if system == "Windows":
         path = os.path.join(home(), f"{name}.bat")
         with open(path, "w") as f:
-            f.write("@echo off\r\ntitle K2 Horizon\r\n" + (f'cd /d "{folder}"\r\n' if folder else "") + f"{cmd}\r\n")
+            f.write("@echo off\r\ntitle K2 Horizon\r\n" + (f'cd /d "{folder}"\r\n' if folder else "") + cmd + "\r\n")
         os.startfile(path)
         return True
     for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
         if shutil.which(term[0]):
-            subprocess.Popen(term + ["sh", "-c", (f'cd "{folder}" && ' if folder else "") + cmd], start_new_session=True,
+            script = (f'cd "{folder}" && ' if folder else "") + cmd
+            subprocess.Popen(term + ["sh", "-c", script], start_new_session=True,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
     return False
 
 
-# ---------------------------------------------------------------- run with Ollama or OpenCode
-def ollama_tag(size, quant):
-    """IFM's tag on Ollama for a size and GGUF file: Q8_0 -> ifm/k2-horizon:3.7b-q8_0, BF16 -> ifm/k2-horizon:3.7b-bf16."""
-    return f"{OLLAMA_REPO}:{size.lower()}-" + ("bf16" if quant == "BF16" else "q" + quant[1:])
+# Ollama and OpenCode
+
+def ollama_running():
+    return subprocess.run(["ollama", "list"], capture_output=True).returncode == 0
 
 
-def ensure_ollama():
-    """Ollama must be installed and new enough to know K2 Horizon; start its background service if it isn't running."""
+def start_ollama():
     if not shutil.which("ollama"):
-        raise SystemExit("Ollama isn't installed. Get it from https://ollama.com/download, then run this again.")
+        sys.exit("Ollama isn't installed. Get it from https://ollama.com/download, then run this again.")
     out = subprocess.run(["ollama", "--version"], capture_output=True, text=True)
-    v = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout + out.stderr)
-    if v and tuple(int(n) for n in v.groups()) < OLLAMA_MIN:
-        raise SystemExit(f"K2 Horizon needs Ollama {'.'.join(map(str, OLLAMA_MIN))} or newer, and this is {v.group(0)}. "
-                         "Update it from https://ollama.com/download, then run this again.")
-    if subprocess.run(["ollama", "list"], capture_output=True).returncode == 0:
+    found = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout + out.stderr)
+    if found and tuple(map(int, found.groups())) < OLLAMA_MIN:
+        sys.exit(f"K2 Horizon needs Ollama {'.'.join(map(str, OLLAMA_MIN))} or newer, and this is {found.group(0)}. "
+                 "Update it from https://ollama.com/download, then run this again.")
+    if ollama_running():
         return
-    kw = {"creationflags": 0x00000008 | 0x00000200} if platform.system() == "Windows" else {"start_new_session": True}
-    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
+    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **background_flags())
     for _ in range(30):
         time.sleep(1)
-        if subprocess.run(["ollama", "list"], capture_output=True).returncode == 0:
+        if ollama_running():
             return
-    raise SystemExit("✗ Ollama is installed but didn't start. Open the Ollama app, then run this again.")
+    sys.exit("Ollama is installed but didn't start. Open the Ollama app, then run this again.")
 
 
 def ollama_model():
-    """Download the chosen model through Ollama and return (name to run it by, IFM tag). The name points to IFM's model with
-    a bigger context: Ollama can default to 4,096 tokens, too few for high reasoning or a coding agent. IFM's listing
-    already sets the recommended temperature and top_p, and high reasoning is the model's own default."""
-    ensure_ollama()
+    """Pull IFM's model and return (local name, IFM tag).
+
+    The local name is IFM's model with a 16k context, because Ollama can default to
+    4,096 tokens, which is too short for high reasoning or a coding agent. IFM's
+    listing already sets the recommended temperature and top_p.
+    """
+    start_ollama()
     size = ARGS.size
     if not size:
-        raise SystemExit(f"Choose a size: {ARGS.cmd} --size 0.9B | 3.7B | 7B   (run check to see what fits)")
-    if ARGS.format == "gguf-bf16" and ARGS.quant not in (None, "BF16"):
-        raise SystemExit("--format gguf-bf16 is the BF16 file; leave out --quant (or use --format gguf with it).")
-    ram = total_ram_gb()
-    quant = "BF16" if ARGS.format == "gguf-bf16" else ARGS.quant or best_quant(size, ram)
-    if fit(MODELS[size]["gb"][quant], ram) == "too big":
-        say(f"⚠ {size} {quant} is too big for this computer's memory, so it will run very slowly. Run check to see what fits.")
-    tag = ollama_tag(size, quant)
+        sys.exit(f"Choose a size: {ARGS.cmd} --size 0.9B | 3.7B | 7B   (run check to see what fits)")
+    quant = pick_quant(size)
+    gb = MODELS[size]["gb"][quant]
+    if fit(gb, total_ram_gb()) == "too big":
+        print(f"Warning: {size} {quant} is too big for this computer's memory, so it will be very slow. "
+              "Run check to see what fits.")
+
+    # Q4_K_M -> ifm/k2-horizon:3.7b-q4_K_M, BF16 -> ifm/k2-horizon:3.7b-bf16
+    tag = f"{OLLAMA_REPO}:{size.lower()}-" + ("bf16" if quant == "BF16" else "q" + quant[1:])
     name = f"k2-horizon-{size.lower()}" + ("-bf16" if quant == "BF16" else "")
-    say(f"Getting {tag} through Ollama ({MODELS[size]['gb'][quant]:.1f} GB; a rerun skips what's already downloaded) …")
+    print(f"Getting {tag} through Ollama ({gb:.1f} GB; a rerun skips what's already downloaded) ...")
     if subprocess.run(["ollama", "pull", tag]).returncode != 0:
-        raise SystemExit("✗ Ollama couldn't download the model (see above). Check the internet connection and run this again.")
+        sys.exit("Ollama couldn't download the model (see above). Check the internet connection and run this again.")
+
     modelfile = os.path.join(home(), f"{name}.Modelfile")
     with open(modelfile, "w") as f:
-        f.write(f"FROM {tag}\nPARAMETER num_ctx {OLLAMA_CONTEXT}\n")
+        f.write(f"FROM {tag}\nPARAMETER num_ctx {CONTEXT}\n")
     out = subprocess.run(["ollama", "create", name, "-f", modelfile], capture_output=True, text=True)
     if out.returncode != 0:
-        raise SystemExit("✗ Ollama couldn't set up the model:\n" + (out.stdout + out.stderr)[-800:])
+        sys.exit("Ollama couldn't set up the model:\n" + (out.stdout + out.stderr)[-800:])
     save_state(ollama_model=name, ollama_tag=tag)
-    say(f"✓ Ready in Ollama as {name} (from {tag}, {OLLAMA_CONTEXT:,}-token context).")
+    print(f"Ready in Ollama as {name} (from {tag}, {CONTEXT:,}-token context).")
     return name, tag
 
 
-def hand_over(args, name, folder=None):
-    """Start an interactive program: in a new window with --window, or here if this is a real terminal."""
+def run_interactive(cmd, name, folder=None):
+    """Open cmd in a new window with --window, otherwise run it here if this is a real terminal."""
     if ARGS.window:
-        if open_in_window(" ".join(f'"{a}"' if " " in a else a for a in args), name, folder):
-            say("✓ Opened it in a new terminal window.")
+        line = " ".join(f'"{a}"' if " " in a else a for a in cmd)
+        if open_in_window(line, name, folder):
+            print("Opened it in a new terminal window.")
         else:
-            say("✗ Couldn't open a terminal window on this computer.")
+            print("Couldn't open a terminal window on this computer.")
     elif sys.stdin.isatty():
-        subprocess.run(args, cwd=folder)
+        subprocess.run(cmd, cwd=folder)
 
 
 def cmd_ollama():
     name, tag = ollama_model()
-    say(f"  Chat: ollama run {name}   (inside: /set think high|medium|low, /bye to quit)\n"
-        f"  API:  http://127.0.0.1:11434/v1  with model \"{name}\"\n"
-        f"  Remove it: ollama rm {name} {tag}")
-    hand_over(["ollama", "run", name], "ollama-chat")
+    print(f"  Chat: ollama run {name}   (inside: /set think high|medium|low, /bye to quit)")
+    print(f'  API:  http://127.0.0.1:11434/v1  with model "{name}"')
+    print(f"  Remove it: ollama rm {name} {tag}")
+    run_interactive(["ollama", "run", name], "ollama-chat")
 
 
 def cmd_opencode():
     if not shutil.which("opencode"):
-        raise SystemExit("OpenCode isn't installed. Get it from https://opencode.ai/download "
-                         "(or run: curl -fsSL https://opencode.ai/install | bash), then run this again in a new terminal.")
+        sys.exit("OpenCode isn't installed. Get it from https://opencode.ai/download "
+                 "(or run: curl -fsSL https://opencode.ai/install | bash), then run this again in a new terminal.")
     if ARGS.size == "0.9B":
-        say("⚠ 0.9B is too small for coding work: in testing it guessed a file path that didn't exist. 3.7B or 7B handled the same task.")
+        print("Warning: 0.9B is too small for coding work. In testing it guessed a file path that didn't exist, "
+              "while 3.7B and 7B did the same task fine.")
     folder = os.path.abspath(os.path.expanduser(ARGS.folder))
     if not os.path.isdir(folder):
-        raise SystemExit(f"✗ No such folder: {folder}")
+        sys.exit(f"No such folder: {folder}")
     name, tag = ollama_model()
-    say(f"  Start it again later, from your project folder: ollama launch opencode --model {name}\n"
-        f"  Remove the model: ollama rm {name} {tag}")
-    hand_over(["ollama", "launch", "opencode", "--model", name, "-y"], "opencode", folder)
+    print(f"  Start it again later, from your project folder: ollama launch opencode --model {name}")
+    print(f"  Remove the model: ollama rm {name} {tag}")
+    run_interactive(["ollama", "launch", "opencode", "--model", name, "-y"], "opencode", folder)
 
 
-# ---------------------------------------------------------------- main
-def build_arg(s):
-    if re.fullmatch(r"latest|tested|b\d+", s):
-        return s
+# Command line
+
+def build_arg(value):
+    if re.fullmatch(r"latest|tested|b\d+", value):
+        return value
     raise argparse.ArgumentTypeError(f"use tested ({TESTED_BUILD}), latest, or a build number like {TESTED_BUILD}")
 
 
 def main():
     global ARGS
-    common = argparse.ArgumentParser(add_help=False)   # so --dir/--port work before or after the command
-    common.add_argument("--dir", default=argparse.SUPPRESS, help="where everything is stored (default ~/k2-horizon-local, or $K2_DIR)")
+    sys.stdout.reconfigure(line_buffering=True)  # show progress right away, even when piped
+
+    # --dir and --port work before or after the command.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--dir", default=argparse.SUPPRESS,
+                        help="where everything is stored (default ~/k2-horizon-local, or $K2_DIR)")
     common.add_argument("--port", type=int, default=argparse.SUPPRESS, help=f"server port (default {PORT})")
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, parents=[common])
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    def sp(name):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     parents=[common])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def command(name):
         return sub.add_parser(name, parents=[common])
-    sp("check")
-    fmts = list(FORMATS)
-    p = sp("install"); p.add_argument("--backend", default="auto", choices=["auto", "cpu", "cuda", "vulkan"]); p.add_argument("--force", action="store_true")
-    p.add_argument("--build", type=build_arg, help=f"llama.cpp build to install: tested ({TESTED_BUILD}, the default), latest, or a build number")
-    p = sp("download"); p.add_argument("--size", choices=list(MODELS)); p.add_argument("--format", default="gguf", choices=fmts)
-    p.add_argument("--quant", choices=["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "BF16"], help="GGUF file to use (BF16 = --format gguf-bf16)")
-    p = sp("serve"); p.add_argument("--size", choices=list(MODELS)); p.add_argument("--format", choices=fmts, help="default: the last one used for that size")
-    p.add_argument("--ctx", type=int, default=16384)
-    p = sp("ask"); p.add_argument("prompt"); p.add_argument("--effort", default="high", choices=["low", "medium", "high"],
-                   help="how much the model thinks first (default high, the most careful)")
-    p.add_argument("--max-tokens", type=int, help="limit the reply length (default: no limit)"); p.add_argument("--show-thinking", action="store_true")
-    p = sp("chat"); p.add_argument("--effort", default="high", choices=["low", "medium", "high"])
-    p.add_argument("--max-tokens", type=int, help="limit each reply's length (default: no limit)"); p.add_argument("--window", action="store_true", help="open the chat in a new terminal window")
+
+    def model_options(p, default_format="gguf"):
+        p.add_argument("--size", choices=list(MODELS))
+        p.add_argument("--format", default=default_format, choices=list(FORMATS))
+        p.add_argument("--quant", choices=QUANTS, help="GGUF file to use (BF16 is the same as --format gguf-bf16)")
+
+    command("check")
+
+    p = command("install")
+    p.add_argument("--backend", default="auto", choices=["auto", "cpu", "cuda", "vulkan"])
+    p.add_argument("--build", type=build_arg,
+                   help=f"tested ({TESTED_BUILD}, the default), latest, or a build number")
+    p.add_argument("--force", action="store_true")
+
+    model_options(command("download"))
+
+    p = command("serve")
+    p.add_argument("--size", choices=list(MODELS))
+    p.add_argument("--format", choices=list(FORMATS), help="default: the last one used for that size")
+    p.add_argument("--ctx", type=int, default=CONTEXT)
+
+    p = command("ask")
+    p.add_argument("prompt")
+    p.add_argument("--effort", default="high", choices=EFFORTS, help="how much the model thinks first (default high)")
+    p.add_argument("--max-tokens", type=int, help="limit the reply length (default: no limit)")
+    p.add_argument("--show-thinking", action="store_true")
+
+    p = command("chat")
+    p.add_argument("--effort", default="high", choices=EFFORTS)
+    p.add_argument("--max-tokens", type=int, help="limit each reply's length (default: no limit)")
+    p.add_argument("--window", action="store_true", help="open the chat in a new terminal window")
+
     for name in ("ollama", "opencode"):
-        p = sp(name); p.add_argument("--size", choices=list(MODELS)); p.add_argument("--format", default="gguf", choices=fmts)
-        p.add_argument("--quant", choices=["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "BF16"], help="GGUF file to use (BF16 = --format gguf-bf16)")
+        p = command(name)
+        model_options(p)
         p.add_argument("--window", action="store_true", help="open it in a new terminal window")
     p.add_argument("--folder", default=".", help="the project folder to work in (default: the current one)")
-    sp("status"); sp("stop")
-    ARGS = ap.parse_args()
+
+    command("status")
+    command("stop")
+
+    ARGS = parser.parse_args()
     ARGS.dir = getattr(ARGS, "dir", None)
     ARGS.port = getattr(ARGS, "port", PORT)
-    {"check": cmd_check, "install": cmd_install, "download": cmd_download, "serve": cmd_serve,
-     "ask": cmd_ask, "chat": cmd_chat, "ollama": cmd_ollama, "opencode": cmd_opencode, "status": cmd_status, "stop": cmd_stop}[ARGS.cmd]()
+    commands = {
+        "check": cmd_check, "install": cmd_install, "download": cmd_download, "serve": cmd_serve,
+        "ask": cmd_ask, "chat": cmd_chat, "status": cmd_status, "stop": cmd_stop,
+        "ollama": cmd_ollama, "opencode": cmd_opencode,
+    }
+    commands[ARGS.cmd]()
 
 
 if __name__ == "__main__":
