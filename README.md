@@ -54,7 +54,7 @@ These are compressed files. For full quality, add `--format gguf-bf16` to `downl
 | `check` | Shows what fits your computer and recommends a size |
 | `install` | Downloads llama.cpp for your system, the build tested with K2 Horizon (`--build latest` for the newest) |
 | `download --size …` | Downloads and verifies a model |
-| `serve --size …` | Starts the model at `http://127.0.0.1:8080` |
+| `serve --size …` | Starts the model |
 | `chat` | Chats in the terminal (`--window` opens a new window) |
 | `ask "…"` | Asks one question |
 | `status` / `stop` | Shows what's running / stops it |
