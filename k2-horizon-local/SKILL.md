@@ -50,9 +50,9 @@ BF16 loads the whole full-precision model into memory, so the same 25% rule appl
 - If this file sits in a folder that has `scripts/k2local.py` next to it (the user downloaded the whole repository), use that path.
 - Otherwise, download the script from the project's GitHub repository into `~/k2-horizon-local/scripts`. This single command works on macOS, Linux and Windows (use `py` instead of `python3` on Windows) and prints the folder:
 ```
-python3 -c "import os,urllib.request as u;d=os.path.join(os.path.expanduser('~'),'k2-horizon-local','scripts');os.makedirs(d,exist_ok=True);u.urlretrieve('https://raw.githubusercontent.com/MBZUAI-IFM/k2-local-deploy/main/k2-horizon-local/scripts/k2local.py',os.path.join(d,'k2local.py'));print(d)"
+python3 -c "import os,urllib.request as u;d=os.path.join(os.path.expanduser('~'),'k2-horizon-local','scripts');os.makedirs(d,exist_ok=True);u.urlretrieve('https://raw.githubusercontent.com/ifm-ai/k2-horizon-local-deploy-skill/main/k2-horizon-local/scripts/k2local.py',os.path.join(d,'k2local.py'));print(d)"
 ```
-Tell the user in one line what you downloaded and from where: one small Python script from github.com/MBZUAI-IFM/k2-local-deploy. If it's already there from an earlier run, reuse it. Run the command again only to update it.
+Tell the user in one line what you downloaded and from where: one small Python script from github.com/ifm-ai/k2-horizon-local-deploy-skill. If it's already there from an earlier run, reuse it. Run the command again only to update it.
 
 ### 1. Check the computer
 ```
@@ -119,11 +119,11 @@ python3 k2local.py serve --size 3.7B                  # optional: --format gguf 
 ```
 This starts the model in the background at `http://127.0.0.1:8080` (local only) and waits until it's ready, usually a few seconds. It sets IFM's recommended settings as the defaults for everything that talks to it, including the web chat and other apps: high reasoning, `top_p` 0.95, and temperature 1.0 (0.6 for 0.9B). Without `--format`, it uses the format last used for that size. It then prints how to use it: the web chat link (llama-server has a chat page at its address), and the exact `chat`, `ask` and `stop` commands.
 
-The model runs in llama-server, which offers an OpenAI-compatible API (`/v1/chat/completions`, with streaming and tools, plus `/health`), used by `ask`, `chat` and everything in [using-from-code.md](https://raw.githubusercontent.com/MBZUAI-IFM/k2-local-deploy/main/k2-horizon-local/references/using-from-code.md).
+The model runs in llama-server, which offers an OpenAI-compatible API (`/v1/chat/completions`, with streaming and tools, plus `/health`), used by `ask`, `chat` and everything in [using-from-code.md](https://raw.githubusercontent.com/ifm-ai/k2-horizon-local-deploy-skill/main/k2-horizon-local/references/using-from-code.md).
 
 K2 Horizon wraps its thinking in tags that change with the effort: `<ifm|think>` (high), `<ifm|think_fast>` (medium) and `<ifm|think_faster>` (low). llama.cpp recognizes them, so replies come back split: the thinking in `reasoning_content`, the answer in `content`, and tool calls in `tool_calls`.
 
-One known exception: at medium effort, 3.7B opens with `<ifm|think_fast>` but closes with `</ifm|think>`, so llama.cpp never finds the end of the thinking. The whole reply lands in `reasoning_content` and `content` is empty (tool calls too). `ask` detects this and recovers the answer; [using-from-code.md](https://raw.githubusercontent.com/MBZUAI-IFM/k2-local-deploy/main/k2-horizon-local/references/using-from-code.md) shows the same fix for the user's own code. This was reported to IFM.
+One known exception: at medium effort, 3.7B opens with `<ifm|think_fast>` but closes with `</ifm|think>`, so llama.cpp never finds the end of the thinking. The whole reply lands in `reasoning_content` and `content` is empty (tool calls too). `ask` detects this and recovers the answer; [using-from-code.md](https://raw.githubusercontent.com/ifm-ai/k2-horizon-local-deploy-skill/main/k2-horizon-local/references/using-from-code.md) shows the same fix for the user's own code. This was reported to IFM.
 
 Only one model runs at a time. To switch size or format, run `stop` and then `serve --size <size> --format <format>`.
 
@@ -147,13 +147,13 @@ Then tell the user, in plain language:
 - **The chat window:** type a message and press Enter. `/new` starts a new conversation, `/effort low|medium|high` changes how much it thinks (`high` by default, the most careful; `low` is faster for quick questions), and `/exit` closes it. To open it again later, use the exact `Chat:` command that `serve` printed. It includes the full script path, plus `--dir` or `--port` when they aren't the defaults, so the user can copy it as is.
 - **The web chat:** give the `Web chat:` link that `serve` printed, normally `http://127.0.0.1:8080`, to open in a browser. It only works on this computer, and only while the model is running.
 - For a single question from the command line, the `Ask:` command that `serve` printed.
-- To use it from code or other apps: it speaks the OpenAI chat API at `/v1`. See [using-from-code.md](https://raw.githubusercontent.com/MBZUAI-IFM/k2-local-deploy/main/k2-horizon-local/references/using-from-code.md).
+- To use it from code or other apps: it speaks the OpenAI chat API at `/v1`. See [using-from-code.md](https://raw.githubusercontent.com/ifm-ai/k2-horizon-local-deploy-skill/main/k2-horizon-local/references/using-from-code.md).
 - To try another size or format: `download --size … [--format …]`, then `stop`, then `serve --size … [--format …]`.
 - To stop: `stop`. It confirms the server exited and the port is free. To start again later, run `serve`; install and download only happen once.
 - To remove everything: delete the `~/k2-horizon-local` folder.
 
 ## When something goes wrong
-Read `references/troubleshooting.md` next to this file or, if it isn't there, [troubleshooting.md](https://raw.githubusercontent.com/MBZUAI-IFM/k2-local-deploy/main/k2-horizon-local/references/troubleshooting.md) on GitHub. It covers the problems actually seen: empty answers, slow output, stalled downloads, GitHub's rate limit, macOS blocking the program, the server quitting on load, and a busy port. `k2local.py status` shows what's downloaded, which size is running, and the port. `server.log` in the storage folder has the server's own messages.
+Read `references/troubleshooting.md` next to this file or, if it isn't there, [troubleshooting.md](https://raw.githubusercontent.com/ifm-ai/k2-horizon-local-deploy-skill/main/k2-horizon-local/references/troubleshooting.md) on GitHub. It covers the problems actually seen: empty answers, slow output, stalled downloads, GitHub's rate limit, macOS blocking the program, the server quitting on load, and a busy port. `k2local.py status` shows what's downloaded, which size is running, and the port. `server.log` in the storage folder has the server's own messages.
 
 ## Recommended settings (from IFM's model pages)
 - `top_p 0.95`. `temperature 1.0`, except **0.9B, which uses 0.6**. `serve` makes these the server's defaults.
